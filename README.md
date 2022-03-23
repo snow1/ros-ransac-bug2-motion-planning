@@ -1,0 +1,1 @@
+Using RANSAC algorithm to detect walls by using laser scan data to be used as wall follower and implemented bug2 to reach some particular goal
