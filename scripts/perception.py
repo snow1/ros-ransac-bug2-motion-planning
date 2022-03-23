@@ -66,7 +66,7 @@ def laser_data(data, args):
     #         ranges = new_ranges
     iterations = 0
     best_inliers_count = 10
-    best_min_dist = -1
+    start_point = (0, 0)
     best_max_dist = 0
     best_line = [(0, 0), (0, 0)]
     point_used = []
@@ -87,18 +87,15 @@ def laser_data(data, args):
             x0, y0 = polar2cart(ranges[index], index/2)
             distance = abs(((x2 - x1) * (y1 - y0)) - ((x1 - x0) * (y2 - y1))) / np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
             if (distance < min_dist):
-                origin_dist = np.sqrt((x0) ** 2 + (y0) ** 2)
                 inliers_indices.append(index)
                 if(ranges[index] < 3.0):
-                    if(best_min_dist < 0):
-                        best_min_dist = origin_dist
+                    if(start_point[0] == 0 and start_point[1] == 0):
                         best_line[0] = (x0, y0)
-                    else:
-                        if(origin_dist < best_min_dist):
-                            best_min_dist = origin_dist
-                            best_line[0] = (x0, y0)
-                    if (origin_dist > best_max_dist):
-                        best_max_dist = origin_dist
+                        start_point = (x0, y0)
+
+                    inlier_dist = np.sqrt((x0 - start_point[0]) ** 2 + (y0 - start_point[1]) ** 2)
+                    if (inlier_dist > best_max_dist):
+                        best_max_dist = inlier_dist
                         best_line[1] = (x0, y0)
 
         # args[2].points.append(Point(x=x1, y=y1, z=0))
