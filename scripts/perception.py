@@ -19,16 +19,17 @@ def odom_data(data: Odometry, args):
 
 def laser_data(data, args):
     # rospy.loginfo(rospy.get_caller_id() + 'I heard %s', data.ranges)
-    ranges = np.array(data.ranges)
-    k = 30
-    min_dist = 0.1
+    # ranges = np.array(data.ranges)
+    k = 20
+    min_dist = 0.2
     min_points = 20
 
-    # ranges = np.zeros((len(data.ranges), 2))
-    # for index in range(len(data.ranges)):
-    #     ranges[index] = [data.ranges[index], index / 2]
-    # strip_indices = np.where(ranges[:, 0] < 3.0)
-    # ranges = ranges[strip_indices]
+    ranges = np.zeros((len(data.ranges), 2))
+    for index in range(ranges.shape[0]):
+        ranges[index] = [data.ranges[index], index / 2]
+    strip_indices = np.where(ranges[:, 0] < 3.0)
+    ranges = ranges[strip_indices]
+
     #
     # if (ranges.shape[0] > 0):
     #     while (ranges.shape[0] > min_points):
@@ -64,60 +65,74 @@ def laser_data(data, args):
     #
     #         new_ranges = np.delete(ranges, best_inliers_indices, axis=0)
     #         ranges = new_ranges
-    iterations = 0
-    best_inliers_count = 10
-    start_point = (0, 0)
-    best_max_dist = 0
-    best_line = [(0, 0), (0, 0)]
-    point_used = []
-    args[2].points = []
-    # rospy.loginfo("loop")
-    while (iterations < k):
-        iterations += 1
-        if(len(np.where(ranges < 3.0)[0]) < 1):
-            return
-        point1, point2 = np.random.choice(np.where(ranges < 3.0)[0], size=2, replace=False)
-        x1, y1 = polar2cart(ranges[point1], point1 / 2)
-        x2, y2 = polar2cart(ranges[point2], point2 / 2)
-        point_used.append(point1)
-        point_used.append(point2)
-        inliers_indices = []
-
-        for index in range(ranges.shape[0]):
-            x0, y0 = polar2cart(ranges[index], index/2)
-            distance = abs(((x2 - x1) * (y1 - y0)) - ((x1 - x0) * (y2 - y1))) / np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-            if (distance < min_dist):
-                inliers_indices.append(index)
-                if(ranges[index] < 3.0):
-                    if(start_point[0] == 0 and start_point[1] == 0):
-                        best_line[0] = (x0, y0)
-                        start_point = (x0, y0)
+    rospy.loginfo("loop")
+    args[1].points = []
+    color_list = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]
+    for loop_i in range(3):
+        if (not ranges.shape[0] > min_points):
+            continue
+        iterations = 0
+        best_inliers_count = 0
+        start_point = [-1, -1]
+        best_inlier_dist = 0
+        best_line = [(-1, -1), (-1, -1)]
+        best_inliers_indices = []
+        rospy.loginfo(f"len ranges: {ranges.shape[0]}")
+        args[2].points = []
+        while (iterations < k):
+            iterations += 1
+            point1, point2 = np.random.choice(range(ranges.shape[0]), size=2, replace=False)
+            x1, y1 = polar2cart(ranges[point1][0], ranges[point1][1])
+            x2, y2 = polar2cart(ranges[point2][0], ranges[point2][1])
+            inliers_indices = []
+            # args[2].points = []
+            for index in range(ranges.shape[0]):
+                x0, y0 = polar2cart(ranges[index][0], ranges[index][1])
+                # args[2].points.append(Point(x=x0, y=y0, z=0))
+                distance = abs(((x2 - x1) * (y1 - y0)) - ((x1 - x0) * (y2 - y1))) / np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+                if (distance < min_dist):
+                    inliers_indices.append(index)
+                    if(start_point[0] < 0 and start_point[1] < 0):
+                        best_line[0] = [x0, y0]
+                        start_point = [x0, y0]
 
                     inlier_dist = np.sqrt((x0 - start_point[0]) ** 2 + (y0 - start_point[1]) ** 2)
-                    if (inlier_dist > best_max_dist):
-                        best_max_dist = inlier_dist
-                        best_line[1] = (x0, y0)
+                    if (len(inliers_indices) > best_inliers_count):
+                        best_inliers_indices = inliers_indices
+                        best_inliers_count = len(inliers_indices)
+                        if (inlier_dist > best_inlier_dist):
+                            best_inlier_dist = inlier_dist
+                            best_line[1] = [x0, y0]
 
-        # args[2].points.append(Point(x=x1, y=y1, z=0))
-        # args[2].points.append(Point(x=x2, y=y2, z=0))
-        if (len(inliers_indices) >= best_inliers_count):
-            # best_inliers_indices = inliers_indices
-            best_inliers_count = len(inliers_indices)
+            # if (len(inliers_indices) >= best_inliers_count):
+            #     best_inliers_indices = inliers_indices
+            #     best_inliers_count = len(inliers_indices)
 
-    args[1].points = []
-    if(best_line):
-        args[1].points.append(Point(x=best_line[0][0], y=best_line[0][1], z=0))
-        args[1].points.append(Point(x=best_line[1][0], y=best_line[1][1], z=0))
-    if (not rospy.is_shutdown()):
-        args[0].publish(args[1])
+        (p00, p01), (p10, p11) = best_line
+        args[1].points.append(Point(x=p00, y=p01, z=0))
+        args[1].points.append(Point(x=p10, y=p11, z=0))
+        args[2].points.append(Point(x=p00, y=p01, z=0))
+        args[2].points.append(Point(x=p10, y=p11, z=0))
+        args[2].color.r = color_list[loop_i][0]
+        args[2].color.g = color_list[loop_i][1]
+        args[2].color.b = color_list[loop_i][2]
+        args[0].publish(args[2])
+        new_ranges = np.delete(ranges, best_inliers_indices, axis=0)
+        ranges = new_ranges
+
+    # rospy.loginfo(f"points: {args[1].points}")
+    # if (not rospy.is_shutdown()):
+    #     rospy.loginfo(f"args1 len:{len(args[1].points)}")
+    #     args[0].publish(args[1])
+    rospy.loginfo("loop out")
 
     # Debug scanner
-    args[2].points = []
-    for index in range(len(data.ranges)):
-        xm, ym = polar2cart(data.ranges[index], index / 2)
-        args[2].points.append(Point(x=xm, y=ym, z=0))
-    if(not rospy.is_shutdown()):
-        args[0].publish(args[2])
+    # args[2].points = []
+    # for index in range(len(data.ranges)):
+    #     xm, ym = polar2cart(data.ranges[index], index / 2)
+    #     args[2].points.append(Point(x=xm, y=ym, z=0))
+    # if(not rospy.is_shutdown()):
+    #     args[0].publish(args[2])
 
 
 def init():
@@ -128,7 +143,7 @@ def init():
 
     line_marker.header.frame_id = "ransac"
     line_marker.header.stamp = rospy.Time.now()
-    line_marker.type = line_marker.LINE_STRIP
+    line_marker.type = line_marker.LINE_LIST
     line_marker.id = 0
     line_marker.pose.orientation.w = 1.0
     line_marker.scale.x = 0.1
@@ -137,7 +152,7 @@ def init():
 
     point_marker.header.frame_id = "ransac"
     point_marker.header.stamp = rospy.Time.now()
-    point_marker.type = line_marker.POINTS
+    point_marker.type = line_marker.LINE_LIST
     point_marker.id = 1
     point_marker.scale.x = 0.02
     point_marker.color.r = 1.0
