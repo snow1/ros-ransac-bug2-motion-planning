@@ -56,24 +56,28 @@ def init():
             twist_msg.linear.x = 0
 
             if (wall_yaw == 0.0):
-                twist_msg.angular.z = 2
-                twist_msg.linear.x = 2
+                twist_msg.angular.z = 0.5
+                if(not obstacle_ahead):
+                    twist_msg.linear.x = 2
             elif (wall_yaw > 0 + yaw_thresh):
                 twist_msg.angular.z = + 3 * np.abs(bot_yaw - wall_yaw)
+                twist_msg.linear.x = 1
             elif (wall_yaw < 0 - yaw_thresh):
                 twist_msg.angular.z = - 3 * np.abs(bot_yaw - wall_yaw)
+                twist_msg.linear.x = 0.2
 
             if (-yaw_thresh < wall_yaw < yaw_thresh and goal_dist >= 0.5):
-                twist_msg.linear.x = 2
+                twist_msg.linear.x = 0.2
+                if(obstacle_ahead):
+                    twist_msg.linear.x = 1  # Approach slowly
 
             twist_pub.publish(twist_msg)
             leave_point_dist = np.sqrt((follow_point[0] - x0) ** 2 + (follow_point[1] - y0) ** 2)
-            if(leave_point_dist >= 0.5 and line_dist <= 0.5):
+            if(leave_point_dist >= 1 and line_dist <= 0.5):
                 seek_point = (x0, y0)
                 state = BotState.GOAL_SEEK
                 rospy.loginfo("Initiating Goal Seek Mode")
-            # if(wall_yaw != 0):
-            #     rospy.loginfo(f"{np.rad2deg(bot_yaw)}")
+
         elif (state == BotState.GOAL_SEEK):
             goal_yaw = np.arctan2(goal_pos[1] - bot_pos.y, goal_pos[0] - bot_pos.x)
             relative_yaw = np.rad2deg(np.arctan2(np.sin(goal_yaw - bot_yaw), np.cos(goal_yaw - bot_yaw)))
@@ -96,8 +100,7 @@ def init():
                 follow_point = (x0, y0)
                 state = BotState.WALL_FOLLOW
                 rospy.loginfo("Initiating Wall Follow Mode")
-            # rospy.loginfo(f"yaw: {relative_yaw}")
-        # rospy.loginfo(line_dist)
+
         if(state != BotState.DONE and goal_dist <= 0.5):
             state = BotState.DONE
             rospy.loginfo("Goal Achieved!")

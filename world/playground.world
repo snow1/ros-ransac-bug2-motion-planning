@@ -67,5 +67,5 @@ floorplan
 )
 
 # throw in a robot
-turtlebot( pose [ -7.0 -3.0 0 90.000 ] name "bug" color "red")
+turtlebot( pose [ -7.0 0.0 0 90.000 ] name "bug" color "red")
 block( pose [ 0.0 4.0 0 180.000 ] color "black")

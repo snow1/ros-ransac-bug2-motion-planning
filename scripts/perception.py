@@ -13,14 +13,6 @@ from std_msgs.msg import Float32, Bool
 def polar2cart(r, theta):
     return r * np.cos(np.deg2rad(theta)), r * np.sin(np.deg2rad(theta))
 
-
-def odom_data(data: Odometry, args):
-    global bot_orientation
-    bot_orientation = data.pose.pose.orientation
-    # args[0].pose.orientation = data.pose.pose.orientation
-    # args[1].pose.orientation = data.pose.pose.orientation
-
-
 def laser_data(data, args):
     k = 20
     min_dist = 0.1
@@ -32,10 +24,10 @@ def laser_data(data, args):
     strip_indices = np.where(ranges[:, 0] < 3.0)
     ranges = ranges[strip_indices]
 
-    obstacle_ahead = np.where(ranges[:, 0] <= 1.0)[0].shape[0] > 0
+    obstacle_ahead = np.where(ranges[:, 0] <= 1)[0].shape[0] > 0
 
     args[1].points = []
-    while(ranges.shape[0] > min_points):
+    while (ranges.shape[0] > min_points):
         iterations = 0
         best_inliers_count = 0
         best_inliers_indices = []
@@ -57,7 +49,7 @@ def laser_data(data, args):
                 distance = abs(((x2 - x1) * (y1 - y0)) - ((x1 - x0) * (y2 - y1))) / denum
                 if (distance < min_dist):
                     inliers_indices.append(index)
-                    if(not start_point):
+                    if (not start_point):
                         start_point = [x0, y0]
 
                     inlier_dist = np.sqrt((x0 - start_point[0]) ** 2 + (y0 - start_point[1]) ** 2)
@@ -70,29 +62,33 @@ def laser_data(data, args):
                 best_inliers_count = len(inliers_indices)
                 best_line = [start_point, end_point]
 
-        (p00, p01), (p10, p11) = best_line
-        args[1].points.append(Point(x=p00, y=p01, z=0))
-        args[1].points.append(Point(x=p10, y=p11, z=0))
-        new_ranges = np.delete(ranges, best_inliers_indices, axis=0)
-        ranges = new_ranges
+        try:
+            (p00, p01), (p10, p11) = best_line
+            args[1].points.append(Point(x=p00, y=p01, z=0))
+            args[1].points.append(Point(x=p10, y=p11, z=0))
+            new_ranges = np.delete(ranges, best_inliers_indices, axis=0)
+            ranges = new_ranges
+        except ValueError:
+            return
 
     if (not rospy.is_shutdown()):
         args[0].publish(args[1])
 
     best_wall_dist = np.inf
     best_wall_yaw = 0
-    points_len = int(len(args[1].points)/2)
+    points_len = int(len(args[1].points) / 2)
     for i in range(points_len):
-        x1, y1 = args[1].points[i*2].x, args[1].points[i*2].y
-        x2, y2 = args[1].points[i*2+1].x, args[1].points[i*2+1].y
+        x1, y1 = args[1].points[i * 2].x, args[1].points[i * 2].y
+        x2, y2 = args[1].points[i * 2 + 1].x, args[1].points[i * 2 + 1].y
         wall_dist = abs(((x2 - x1) * (y1)) - ((x1) * (y2 - y1))) / np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
         wall_yaw = np.arctan2(x1 - x2, y1 - y2)
-        if(wall_dist < best_wall_dist and wall_dist <= 0.8):
+        if (wall_dist < best_wall_dist and wall_dist <= 0.8):
             best_wall_dist = wall_dist
             best_wall_yaw = wall_yaw
-    # rospy.loginfo(np.rad2deg(best_wall_yaw))
+
     args[3].publish(-best_wall_yaw)
     args[4].publish(obstacle_ahead)
+
     # Debug scanner
     # args[2].points = []
     # for index in range(len(data.ranges)):
@@ -127,7 +123,6 @@ def init():
     wall_angle_pub = rospy.Publisher("/wall_angle", Float32, queue_size=10)
     obstacle_pub = rospy.Publisher("/obstacle_ahead", Bool, queue_size=10)
     rospy.Subscriber('/base_scan', LaserScan, laser_data, (marker_pub, line_marker, point_marker, wall_angle_pub, obstacle_pub))
-    rospy.Subscriber('/odom', Odometry, odom_data, (line_marker, point_marker))
 
     rate = rospy.Rate(10)
     while not rospy.is_shutdown():
