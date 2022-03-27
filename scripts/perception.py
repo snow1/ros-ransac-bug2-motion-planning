@@ -5,7 +5,9 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker
 from geometry_msgs.msg import Point
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
 import numpy as np
+from std_msgs.msg import Float32, Bool
 
 
 def polar2cart(r, theta):
@@ -13,20 +15,24 @@ def polar2cart(r, theta):
 
 
 def odom_data(data: Odometry, args):
-    args[1].pose.orientation = data.pose.pose.orientation
-    args[2].pose.orientation = data.pose.pose.orientation
+    global bot_orientation
+    bot_orientation = data.pose.pose.orientation
+    # args[0].pose.orientation = data.pose.pose.orientation
+    # args[1].pose.orientation = data.pose.pose.orientation
 
 
 def laser_data(data, args):
     k = 20
-    min_dist = 0.15
-    min_points = 20
+    min_dist = 0.1
+    min_points = 50
 
     ranges = np.zeros((len(data.ranges), 2))
     for index in range(ranges.shape[0]):
         ranges[index] = [data.ranges[index], index / 2]
     strip_indices = np.where(ranges[:, 0] < 3.0)
     ranges = ranges[strip_indices]
+
+    obstacle_ahead = np.where(ranges[:, 0] <= 1.0)[0].shape[0] > 0
 
     args[1].points = []
     while(ranges.shape[0] > min_points):
@@ -73,17 +79,30 @@ def laser_data(data, args):
     if (not rospy.is_shutdown()):
         args[0].publish(args[1])
 
+    best_wall_dist = np.inf
+    best_wall_yaw = 0
+    points_len = int(len(args[1].points)/2)
+    for i in range(points_len):
+        x1, y1 = args[1].points[i*2].x, args[1].points[i*2].y
+        x2, y2 = args[1].points[i*2+1].x, args[1].points[i*2+1].y
+        wall_dist = abs(((x2 - x1) * (y1)) - ((x1) * (y2 - y1))) / np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        wall_yaw = np.arctan2(x1 - x2, y1 - y2)
+        if(wall_dist < best_wall_dist and wall_dist <= 0.8):
+            best_wall_dist = wall_dist
+            best_wall_yaw = wall_yaw
+    # rospy.loginfo(np.rad2deg(best_wall_yaw))
+    args[3].publish(-best_wall_yaw)
+    args[4].publish(obstacle_ahead)
     # Debug scanner
-    args[2].points = []
-    for index in range(len(data.ranges)):
-        xm, ym = polar2cart(data.ranges[index], index / 2)
-        args[2].points.append(Point(x=xm, y=ym, z=0))
-    if(not rospy.is_shutdown()):
-        args[0].publish(args[2])
+    # args[2].points = []
+    # for index in range(len(data.ranges)):
+    #     xm, ym = polar2cart(data.ranges[index], index / 2)
+    #     args[2].points.append(Point(x=xm, y=ym, z=0))
+    # if(not rospy.is_shutdown()):
+    #     args[0].publish(args[2])
 
 
 def init():
-
     marker_pub = rospy.Publisher("visualization_marker", Marker, queue_size=10)
     line_marker = Marker()
     point_marker = Marker()
@@ -105,8 +124,10 @@ def init():
     point_marker.color.r = 1.0
     point_marker.color.a = 1.0
 
-    rospy.Subscriber('/base_scan', LaserScan, laser_data, (marker_pub, line_marker, point_marker))
-    # rospy.Subscriber('/odom', Odometry, odom_data, (marker_pub, line_marker, point_marker))
+    wall_angle_pub = rospy.Publisher("/wall_angle", Float32, queue_size=10)
+    obstacle_pub = rospy.Publisher("/obstacle_ahead", Bool, queue_size=10)
+    rospy.Subscriber('/base_scan', LaserScan, laser_data, (marker_pub, line_marker, point_marker, wall_angle_pub, obstacle_pub))
+    rospy.Subscriber('/odom', Odometry, odom_data, (line_marker, point_marker))
 
     rate = rospy.Rate(10)
     while not rospy.is_shutdown():
@@ -114,5 +135,6 @@ def init():
 
 
 if __name__ == '__main__':
+    bot_orientation = []
     rospy.init_node('perception', anonymous=True)
     init()
