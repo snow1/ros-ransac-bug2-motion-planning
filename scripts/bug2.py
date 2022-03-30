@@ -18,6 +18,10 @@ class BotState(Enum):
 def odom_data(data: Odometry):
     global bot_odom
     bot_odom = data
+    global start_pos
+    if not start_pos:
+        start_pos = [data.pose.pose.position.x, data.pose.pose.position.y]
+        rospy.loginfo(f"Start position initialized as: {start_pos}")
 
 
 def obstacle_callback(data: Bool):
@@ -39,10 +43,12 @@ def init():
     follow_point = (0, 0)
     seek_point = (0, 0)
     state = BotState.GOAL_SEEK
-    rospy.loginfo("Initiating Goal Seek Mode")
-    global obstacle_ahead, wall_yaw
+    rospy.loginfo("Starting in Goal Seek Mode")
+    global obstacle_ahead, wall_yaw, start_pos
     rate = rospy.Rate(10)
     while not rospy.is_shutdown():
+        if(not start_pos):
+            continue
         bot_pos = bot_odom.pose.pose.position
         bot_yaw = euler_from_quaternion([bot_odom.pose.pose.orientation.x, bot_odom.pose.pose.orientation.y, bot_odom.pose.pose.orientation.z, bot_odom.pose.pose.orientation.w])[2]
         goal_dist = np.sqrt(np.square(bot_pos.x - goal_pos[0]) + np.square(bot_pos.y - goal_pos[1]))
@@ -109,11 +115,10 @@ def init():
 
 if __name__ == '__main__':
     bot_odom = Odometry()
+    start_pos = []
     obstacle_ahead = False
     wall_yaw = 0
     rospy.init_node('bug2', anonymous=True)
-    start_pos = rospy.get_param('~start_pos')
     goal_pos = rospy.get_param('~goal_pos')
-    rospy.loginfo(f"start position: {start_pos}")
-    rospy.loginfo(f"goal position: {goal_pos}")
+    rospy.loginfo(f"Goal position initialized as: {goal_pos}")
     init()
