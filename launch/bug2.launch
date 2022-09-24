@@ -1,7 +1,7 @@
 <launch>
-    <node name="stage" pkg="stage_ros" type="stageros" args="$(find lab6)/world/playground.world"/>
-    <node name="perception" pkg="lab6" type="perception.py" output="screen"/>
-    <node name="bug2" pkg="lab6" type="bug2.py" output="screen">
+    <node name="stage" pkg="stage_ros" type="stageros" args="$(find ransacbug2)/world/playground.world"/>
+    <node name="perception" pkg="ransacbug2" type="perception.py" output="screen"/>
+    <node name="bug2" pkg="ransacbug2" type="bug2.py" output="screen">
         <rosparam param="goal_pos">[4.36, 9]</rosparam>
     </node>
 </launch>

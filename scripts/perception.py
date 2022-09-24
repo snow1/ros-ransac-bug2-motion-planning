@@ -1,18 +1,19 @@
 #!/usr/bin/env python
 
 import rospy
-from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker
 from geometry_msgs.msg import Point
-from tf.transformations import euler_from_quaternion, quaternion_from_euler
 import numpy as np
 from std_msgs.msg import Float32, Bool
 
 
+# Converts from polar to cartesian co-ordinates
 def polar2cart(r, theta):
     return r * np.cos(np.deg2rad(theta)), r * np.sin(np.deg2rad(theta))
 
+
+# Laser scan callback, implements RANSAC algorithm and passes wall yaw angle to bug2
 def laser_data(data, args):
     k = 20
     min_dist = 0.1
@@ -27,13 +28,13 @@ def laser_data(data, args):
     obstacle_ahead = np.where(ranges[:, 0] <= 1)[0].shape[0] > 0
 
     args[1].points = []
-    while (ranges.shape[0] > min_points):
+    while ranges.shape[0] > min_points:
         iterations = 0
         best_inliers_count = 0
         best_inliers_indices = []
         args[2].points = []
         best_line = [(-1, -1), (-1, -1)]
-        while (iterations < k):
+        while iterations < k:
             iterations += 1
             point1, point2 = np.random.choice(range(ranges.shape[0]), size=2, replace=False)
             x1, y1 = polar2cart(ranges[point1][0], ranges[point1][1])
@@ -47,17 +48,17 @@ def laser_data(data, args):
             for index in range(ranges.shape[0]):
                 x0, y0 = polar2cart(ranges[index][0], ranges[index][1])
                 distance = abs(((x2 - x1) * (y1 - y0)) - ((x1 - x0) * (y2 - y1))) / denum
-                if (distance < min_dist):
+                if distance < min_dist:
                     inliers_indices.append(index)
-                    if (not start_point):
+                    if not start_point:
                         start_point = [x0, y0]
 
                     inlier_dist = np.sqrt((x0 - start_point[0]) ** 2 + (y0 - start_point[1]) ** 2)
-                    if (inlier_dist > best_inlier_dist):
+                    if inlier_dist > best_inlier_dist:
                         best_inlier_dist = inlier_dist
                         end_point = [x0, y0]
 
-            if (len(inliers_indices) >= best_inliers_count):
+            if len(inliers_indices) >= best_inliers_count:
                 best_inliers_indices = inliers_indices
                 best_inliers_count = len(inliers_indices)
                 best_line = [start_point, end_point]
@@ -71,25 +72,26 @@ def laser_data(data, args):
         except ValueError:
             return
 
-    if (not rospy.is_shutdown()):
+    if not rospy.is_shutdown():
         args[0].publish(args[1])
 
     best_wall_dist = np.inf
     best_wall_yaw = 0
     points_len = int(len(args[1].points) / 2)
+    # Finds the closest wall angle
     for i in range(points_len):
         x1, y1 = args[1].points[i * 2].x, args[1].points[i * 2].y
         x2, y2 = args[1].points[i * 2 + 1].x, args[1].points[i * 2 + 1].y
-        wall_dist = abs(((x2 - x1) * (y1)) - ((x1) * (y2 - y1))) / np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        wall_dist = abs(((x2 - x1) * y1) - (x1 * (y2 - y1))) / np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
         wall_yaw = np.arctan2(x1 - x2, y1 - y2)
-        if (wall_dist < best_wall_dist and wall_dist <= 0.8):
+        if wall_dist < best_wall_dist and wall_dist <= 0.8:
             best_wall_dist = wall_dist
             best_wall_yaw = wall_yaw
 
     args[3].publish(-best_wall_yaw)
     args[4].publish(obstacle_ahead)
 
-    # Debug scanner
+    # Enable to Debug scanner
     # args[2].points = []
     # for index in range(len(data.ranges)):
     #     xm, ym = polar2cart(data.ranges[index], index / 2)
@@ -99,6 +101,7 @@ def laser_data(data, args):
 
 
 def init():
+    # For rviz, visualizes ransac lines
     marker_pub = rospy.Publisher("visualization_marker", Marker, queue_size=10)
     line_marker = Marker()
     point_marker = Marker()
@@ -109,7 +112,7 @@ def init():
     line_marker.id = 0
     line_marker.pose.orientation.w = 1.0
     line_marker.scale.x = 0.02
-    line_marker.color.b = 1.0
+    line_marker.color.g = 1.0
     line_marker.color.a = 1.0
 
     point_marker.header.frame_id = "ransac"
