@@ -26,5 +26,5 @@ roslaunch ransacbug2 bug2.launch
 ```
 
 ### Motion Planning Demo
-![](https://github.com/JayParikh20/astar_pathfinding/blob/main/demo/ransac_bug2.gif)
+![](https://github.com/JayParikh20/ransac_bug2/blob/main/demo/ransac_bug2.gif)
 
