@@ -55,6 +55,8 @@ class LockerV2:
         self.wall_yaw  = float('nan')
         self.clearance = float('nan')
 
+        self.is_correcting = 0
+
         # 记忆（最近一次可靠墙）
         self.mem_dist = float('nan')
         self.mem_yaw  = float('nan')
@@ -152,13 +154,14 @@ class LockerV2:
             now = rospy.Time.now().to_sec()
             vx = vy = wz = 0.0
             reason = ""
+            rospy.loginfo("[bug2_safe] -> %s", self.state)
 
             # 安全：前障即停
-            if self.obs_front == 1 or (isinstance(self.clearance, float) and self.clearance < self.front_stop):
+            """if self.obs_front == 1 or (isinstance(self.clearance, float) and self.clearance < self.front_stop):
                 self.state = "FAIL_STOP"
                 self.stop("OBS_FRONT")
                 rate.sleep()
-                continue
+                continue"""
 
             # 感知超时：按丢失处理
             perc_age = (now - self.last_perc_t) if self.last_perc_t else 999
@@ -216,11 +219,11 @@ class LockerV2:
                 reason = "HOLD_KEEP_STRAIGHT"
 
                 # 超时则停
-                if perc_age > self.loss_timeout_stop:
+                """if perc_age > self.loss_timeout_stop:
                     self.state = "FAIL_STOP"
                     self.stop("HOLD_TIMEOUT")
                     rate.sleep()
-                    continue
+                    continue"""
 
                 # 再捕获：与记忆差异不大则回 LOCKED_GO
                 if self.has_wall and not isnan(self.wall_dist) and not isnan(self.wall_yaw) and self.mem_time:
@@ -250,7 +253,29 @@ class LockerV2:
 
             # 发布（带限幅与软门）
             print(f"State: {self.state}, Reason: {reason}, Wall Dist: {self.wall_dist:.2f}, Wall Yaw: {self.wall_yaw:.2f}, Clearance: {self.clearance:.2f}")
-            print(f"vx: {vx:.2f}, vy: {vy:.2f}, wz: {wz:.2f}, Soft Gate: {self.soft_gate:.2f}")
+
+
+            target = 0.65
+
+            
+            vy = 0.0
+            sign = -1.0 if target > self.wall_dist else 1.0
+            if (self.is_correcting <= 0):
+                vx = 0.1
+                wz = 0.0
+                if self.is_correcting == 0:
+                    self.is_correcting = 5
+                else:
+                    self.is_correcting += 1
+            else:
+                vx = 0.0
+                wz = max(min(target-self.wall_dist, 0.5), -0.5)
+                self.is_correcting -= 1
+                if self.is_correcting == 0:
+                    self.is_correcting = -3
+
+            print(f"wz: {self.is_correcting}")
+
             self.publish(vx, vy, wz, reason)
             rate.sleep()
 

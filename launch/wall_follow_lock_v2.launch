@@ -15,7 +15,7 @@
   <!-- 感知（RANSAC+质量指标） -->
   <node pkg="ransacbug2" type="perception_lock_v2.py" name="perception_lock_v2" output="screen">
     <param name="right_deg_min" value="-90.0"/>
-    <param name="right_deg_max" value="-25.0"/>
+    <param name="right_deg_max" value="90.0"/>
     <param name="min_points" value="25"/>
     <param name="inlier_thresh" value="0.04"/>
     <param name="min_inliers" value="20"/>
