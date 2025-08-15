@@ -1,0 +1,19 @@
+<launch>
+  <!-- Start Stage with your custom world -->
+  <node pkg="stage_ros" type="stageros" name="stageros" output="screen"
+        args="$(find ransacbug2)/world/playground.world">
+    <param name="base_watchdog_timeout" value="0"/>
+  </node>
+
+  <!-- Perception Node (RANSAC wall detection) -->
+  <node name="perception" pkg="ransacbug2" type="perception-sim.py" output="screen"/>
+
+  <!-- Bug2 Planner Node -->
+  <node name="bug2" pkg="ransacbug2" type="bug2-sim.py" output="screen">
+    <!-- Set your goal position here -->
+    <rosparam param="goal_pos">[15.0, -5.5]</rosparam>
+  </node>
+
+  <!-- (Optional) RViz for Visualization
+  <node pkg="rviz" type="rviz" name="rviz" output="screen"/> -->
+</launch>

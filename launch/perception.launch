@@ -1,5 +1,14 @@
 <launch>
+    <!-- Start your RPLIDAR driver (edit port as needed) -->
+    
+    <!-- Wall perception node -->
+    <node name="perception" pkg="ransacbug2" type="perception.py" output="screen"/>
+</launch>
+
+<!--
+<launch>
 	<node name="stage" pkg="stage_ros" type="stageros" args="$(find ransacbug2)/world/playground.world" />
 	<node name="perception" pkg="ransacbug2" type="perception.py" output="screen"/>
 	<node name="rviz" pkg="rviz" type="rviz" args="-d $(find ransacbug2)/rviz/config.rviz" />
 </launch>
+-->

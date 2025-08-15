@@ -1,0 +1,46 @@
+<launch>
+<include file="$(find rplidar_ros)/launch/rplidar_s3.launch"/>
+
+<!-- static_transform_publisher x y z yaw pitch roll frame_id child_frame_id period_in_ms -->
+  <node pkg="tf" type="static_transform_publisher" name="base_to_laser"
+        args="-0.3942 0.5843 0.8500  -1.5381 0 0  base_link laser 50"/>
+
+
+<node pkg="rosserial_python" type="serial_node.py" name="rosserial">
+  <param name="port" value="/dev/ttyUSB1"/>
+  <param name="baud" value="57600"/>
+</node>
+
+
+  <!-- 感知（RANSAC+质量指标） -->
+  <node pkg="ransacbug2" type="perception_lock_v2.py" name="perception_lock_v2" output="screen">
+    <param name="right_deg_min" value="-90.0"/>
+    <param name="right_deg_max" value="-25.0"/>
+    <param name="min_points" value="25"/>
+    <param name="inlier_thresh" value="0.04"/>
+    <param name="min_inliers" value="20"/>
+    <param name="max_rms" value="0.06"/>
+    <param name="clear_front_deg" value="18.0"/>
+  </node>
+
+  <!-- 控制（ALIGN→LOCKED_GO→HOLD） -->
+  <node pkg="ransacbug2" type="bug2_lock_v2.py" name="bug2_lock_v2" output="screen">
+    <param name="target_dist" value="0.50"/>
+    <param name="align_tol_d" value="0.03"/>
+    <param name="align_tol_y" value="0.03"/>
+
+    <param name="forward_speed" value="0.12"/>
+    <param name="forward_speed_hold" value="0.08"/>
+    <param name="min_forward_speed" value="0.06"/>
+
+    <param name="front_stop" value="0.40"/>
+    <param name="loss_grace" value="0.8"/>
+    <param name="loss_timeout_stop" value="2.5"/>
+    <param name="reacq_tol_d" value="0.08"/>
+    <param name="reacq_tol_y" value="0.10"/>
+
+    <param name="loss_slowdown_window" value="10.0"/>
+    <param name="loss_slowdown_thresh" value="3"/>
+    <param name="cmd_topic" value="/cmd_vel"/>
+  </node>
+</launch>

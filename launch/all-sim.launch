@@ -1,0 +1,59 @@
+<launch>
+  <!-- RPLIDAR node -->
+  <include file="$(find ransacbug2)/launch/rplidar_s3.launch"/>
+  
+  <node pkg="tf" type="static_transform_publisher" name="base_to_laser"
+      args="0 0 0 0 0 0 base_link laser 100" />
+ 
+
+
+  <!-- Static TF from base_link to lidar_link -->
+  <node pkg="tf" type="static_transform_publisher" name="base_to_lidar"
+        args="0 0 0 0 0 0 base_link lidar_link 100" />
+
+  <!-- Static TF from base_link to camera_link -->
+  <node pkg="tf" type="static_transform_publisher" name="base_to_camera"
+        args="0 0 0.15 0 0 0 base_link camera_link 100" />
+
+  <!-- Temporary static odom->base_link transform (replace with visual odometry when fixed!) -->
+  <node pkg="tf" type="static_transform_publisher" name="odom_to_base"
+      args="0 0 0 0 0 0 odom base_link 100" />
+ 
+
+  <!-- RealSense D455 (nodelet manager) in 'camera' namespace -->
+  <node pkg="nodelet" type="nodelet" name="realsense2_camera_manager" args="manager" output="screen" ns="camera"/>
+  <node pkg="nodelet" type="nodelet" name="realsense2_camera" args="load realsense2_camera/RealSenseNodeFactory realsense2_camera_manager" output="screen" ns="camera">
+    <param name="serial_no" type="string" value=""/>
+    <param name="align_depth.enable" type="bool" value="false"/>
+    <param name="pointcloud.enable" type="bool" value="false"/>
+    <remap from="depth/color/points" to="/camera/depth/color/points"/>
+  </node>
+
+  <!-- RTAB-Map Visual Odometry (VO only, not SLAM) -->
+  <include file="$(find rtabmap_ros)/launch/rtabmap.launch">
+    <arg name="rgb_topic" value="/camera/color/image_raw"/>
+    <arg name="depth_topic" value="/camera/depth/image_rect_raw"/>
+    <arg name="camera_info_topic" value="/camera/color/camera_info"/>
+    <arg name="visual_odometry" value="true"/>
+    <arg name="frame_id" value="base_link"/>
+    <arg name="odom_topic" value="/odom"/>
+    <arg name="subscribe_scan" value="false"/>
+    <arg name="subscribe_scan_cloud" value="false"/>
+    <arg name="subscribe_rgbd" value="false"/>
+  </include>
+
+  <!-- Perception Node -->
+  <node name="perception" pkg="ransacbug2" type="perception.py" output="screen"/>
+
+  <!-- Wall Follower Node -->
+  <node name="wall_follower" pkg="ransacbug2" type="bug2.py" output="screen"/>
+
+  <!-- Arduino communication via rosserial -->
+  <node pkg="rosserial_python" type="serial_node.py" name="rosserial" output="screen">
+    <param name="port" value="/dev/ttyUSB0"/> <!-- Update to your Arduino's port -->
+    <param name="baud" value="57600"/>
+  </node>
+
+  <!-- Optionally: Record all topics -->
+  <node name="rosbag_record" pkg="rosbag" type="record" args="-a" output="screen"/>
+</launch>

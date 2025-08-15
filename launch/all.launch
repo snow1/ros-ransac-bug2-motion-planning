@@ -1,0 +1,33 @@
+<launch>
+    <!-- 1. 激光雷达 RPLIDAR S3 -->
+    <include file="$(find rplidar_ros)/launch/rplidar_s3.launch"/>
+
+    <!-- 2. Realsense D456 相机 -->
+    <include file="$(find realsense2_camera)/launch/rs_camera.launch"/>
+
+    <!-- 3. RTAB-Map 视觉里程计/SLAM（自动发布 odom->base_link, map->odom 等tf） -->
+    <include file="$(find rtabmap_ros)/launch/rtabmap.launch">
+        <arg name="rgb_topic" value="/camera/color/image_raw"/>
+        <arg name="depth_topic" value="/camera/depth/image_rect_raw"/>
+        <arg name="camera_info_topic" value="/camera/color/camera_info"/>
+        <arg name="approx_sync" value="true"/>
+        <arg name="visual_odometry" value="true"/>
+    </include>
+
+    <!-- 4. 可选：如果你需要转发odom -->
+    <node pkg="topic_tools" type="relay" name="odom_relay" args="/rtabmap/odom /odom"/>
+
+    <!-- 5. 感知节点（激光墙检测） -->
+    <node name="perception" pkg="ransacbug2" type="perception.py" output="screen"/>
+
+    <!-- 6. 导航节点（bug2导航） -->
+    <node name="bug2" pkg="ransacbug2" type="bug2.py" output="screen">
+        <rosparam param="goal_pos">[4.36, 9]</rosparam>
+    </node>
+
+    <!-- 7. 静态tf：base_link->laser（必须有） -->
+    <node pkg="tf" type="static_transform_publisher" name="laser_to_base_link"
+          args="0 0 0 0 0 0 base_link laser 100" />
+
+    <!-- 绝不要再加 odom->base_link 的静态tf，留给RTAB-Map/真实定位节点自动发布 -->
+</launch>
