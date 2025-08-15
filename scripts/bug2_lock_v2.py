@@ -4,6 +4,7 @@ import rospy, csv, time
 from geometry_msgs.msg import Twist, Point32
 from std_msgs.msg import Header
 from math import isnan
+from std_msgs.msg import Float32
 
 class LockerV2:
     def __init__(self):
@@ -67,6 +68,7 @@ class LockerV2:
         self.pub_cmd = rospy.Publisher(self.cmd_topic, Twist, queue_size=10)
         rospy.Subscriber("wall/perception", Point32, self.cb_perc, queue_size=1)
         rospy.Subscriber("wall/flags", Header, self.cb_flags, queue_size=1)
+        #rospy.Subscriber("/wall_lateral",   Float32, self.cb_dist, queue_size=1)
 
         # CSV（更详细）
         self.csvf = open(self.log_path, "w", newline="")
@@ -246,6 +248,8 @@ class LockerV2:
                 continue
 
             # 发布（带限幅与软门）
+            print(f"State: {self.state}, Reason: {reason}, Wall Dist: {self.wall_dist:.2f}, Wall Yaw: {self.wall_yaw:.2f}, Clearance: {self.clearance:.2f}")
+            print(f"vx: {vx:.2f}, vy: {vy:.2f}, wz: {wz:.2f}, Soft Gate: {self.soft_gate:.2f}")
             self.publish(vx, vy, wz, reason)
             rate.sleep()
 

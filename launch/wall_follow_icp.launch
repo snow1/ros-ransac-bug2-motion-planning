@@ -32,7 +32,7 @@
   <!-- Your perception & controller -->
 <!-- Perception -->
   <node pkg="ransacbug2" type="perception.py" name="perception" output="screen">
-    <param name="side" value="right"/>
+    <param name="side" value="left"/>
     <param name="scan_topic" value="/scan"/>
     <param name="sector_center_deg" value="-90.0"/>
     <param name="sector_width_deg"  value="70.0"/>
@@ -45,7 +45,7 @@
   </node>
 
 <node pkg="ransacbug2" type="bug2.py" name="wall_follower" output="screen">
-    <param name="side" value="right"/>
+    <param name="side" value="left"/>
     <param name="d_ref" value="0.50"/>
     <param name="right_overhang" value="0.12"/>   <!-- 先按12cm估，量准后再调 -->
     <param name="band_d" value="0.05"/>
