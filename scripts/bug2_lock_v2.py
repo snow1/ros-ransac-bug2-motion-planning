@@ -42,7 +42,7 @@ class LockerV2:
         self.soft_enable = rospy.get_param("~soft_enable", True)
 
         # === 话题与日志 ===
-        self.cmd_topic = rospy.get_param("~cmd_topic", "cmd_vel")
+        self.cmd_topic = rospy.get_param("~cmd_topic", "/cmd_vel")
         self.log_path = rospy.get_param("~log_path", "/tmp/wf_lock_v2_{:d}.csv".format(int(time.time())))
 
         # === 状态 ===
@@ -193,6 +193,7 @@ class LockerV2:
             elif self.state == "LOCKED_GO":
                 # 直行：vx 固定；vy=0, wz=0
                 vx = self.forward_speed
+               # wz = 1.0
                 reason = "LOCKED_GO"
 
                 # 维护记忆

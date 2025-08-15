@@ -162,7 +162,10 @@ class WallFollowerSafe:
                 # 真实间隙 = 激光测距 - 外伸量（右墙）
                 clearance = self.wall_dist - (self.right_overhang if right else 0.0)
                 e_d   = (d_target - clearance)            # >0: 太近，需要远离墙
-                e_d_c = self.deadband(e_d, self.band_d)
+                vx_des = -0.05 if phase > 0.5 else 0.0
+                vy_des = 0.0
+                w_des  = 0.2
+                """e_d_c = self.deadband(e_d, self.band_d)
                 vy_des = self.k_dist * e_d_c * away_sign  # 远离墙为正方向
                 vx_des = self.vx_nom
 
@@ -173,9 +176,11 @@ class WallFollowerSafe:
 
                 # 护栏：太近（以真实间隙判断）
                 margin_close = (d_target - clearance)     # >0 表示太近
+                rospy.loginfo("margin_close=%.2f", margin_close)
                 if margin_close > self.emergency_margin:
                     self.t_emg_until = time.time() + self.emergency_time
                 elif margin_close > self.brake_margin:
+                    rospy.loginfo("Magnus")
                     vx_des = min(vx_des, self.vx_min)
                     vy_des = clamp(vy_des + 0.12*away_sign, -self.vy_max, self.vy_max)
 
@@ -187,13 +192,18 @@ class WallFollowerSafe:
                 if self.yaw_hold:
                     yaw_err = wrap(self.wall_yaw)          # 目标=0（与墙平行）
                     w_raw  = self.k_yaw * self.deadband(yaw_err, self.yaw_deadband)
-                    w_des  = clamp(w_raw, -self.w_max, self.w_max)
+                    w_des  = clamp(w_raw, -self.w_max, self.w_max)"""
             # 急停外滑窗口：先轻退，再定住 + 最大外滑
             if time.time() < self.t_emg_until:
                 phase = (self.t_emg_until - time.time()) / max(self.emergency_time, 1e-3)
                 vx_des = -0.05 if phase > 0.5 else 0.0
                 vy_des = away_sign * self.vy_max
                 w_des  = 0.0
+
+            vx_des = 0.01   
+            vy_des = 0.0
+            w_des  = -0.1
+            rospy.loginfo("[bug2_safe] -> %s", self.wall_dist)
 
         else:
             self.set_state("START")
