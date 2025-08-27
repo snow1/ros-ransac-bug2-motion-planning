@@ -9,6 +9,7 @@ Panels:
         - /Marker1
         - /Marker1/Status1
         - /LaserScan1/Status1
+        - /PointStamped1
       Splitter Ratio: 0.5
     Tree Height: 732
   - Class: rviz/Selection
@@ -59,7 +60,9 @@ Visualization Manager:
       Marker Topic: /visualization_marker
       Name: Marker
       Namespaces:
-        {}
+        corner: true
+        sector: true
+        wall: true
       Queue Size: 100
       Value: true
     - Angle Tolerance: 0.10000000149011612
@@ -126,12 +129,16 @@ Visualization Manager:
       Use rainbow: true
       Value: true
     - Class: rviz/TF
-      Enabled: false
+      Enabled: true
       Filter (blacklist): ""
       Filter (whitelist): ""
       Frame Timeout: 15
       Frames:
         All Enabled: true
+        base_link:
+          Value: true
+        laser:
+          Value: true
       Marker Alpha: 1
       Marker Scale: 1
       Name: TF
@@ -139,9 +146,11 @@ Visualization Manager:
       Show Axes: true
       Show Names: true
       Tree:
-        {}
+        base_link:
+          laser:
+            {}
       Update Interval: 0
-      Value: false
+      Value: true
     - Alpha: 0.699999988079071
       Class: rviz/Map
       Color Scheme: raw
@@ -192,6 +201,17 @@ Visualization Manager:
       Topic: /rtabmap/mapPath
       Unreliable: false
       Value: true
+    - Alpha: 1
+      Class: rviz/PointStamped
+      Color: 204; 41; 204
+      Enabled: true
+      History Length: 1
+      Name: PointStamped
+      Queue Size: 10
+      Radius: 0.20000000298023224
+      Topic: /corner_point
+      Unreliable: false
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -220,7 +240,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 14.402348518371582
+      Distance: 4.53340482711792
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -236,9 +256,9 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.6147972941398621
+      Pitch: 0.5947969555854797
       Target Frame: <Fixed Frame>
-      Yaw: 0.3303965926170349
+      Yaw: 4.0735554695129395
     Saved: ~
 Window Geometry:
   Displays:
