@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 # =======================
 # File: bug2_lock_v4.py
 # Node: bug2_lock_v4
@@ -29,8 +31,6 @@
 # 坐标系：REP-103 标准  base_link：+X前  +Y左  +Z上
 # =======================
 
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 import time, csv, math
 import numpy as np
 import rospy
@@ -89,7 +89,9 @@ class WallFollower:
     def __init__(self):
         # ====== 基础参数（可在 launch 覆盖）======
         self.side = rospy.get_param("~side", "right")  # right/left  → 决定转向与侧向正方向
-        self.cmd_vy_sign = rospy.get_param("~cmd_vy_sign", +1.0)  # +1 标准：+Y向左；若物理接线反，设 -1
+        self.cmd_vy_sign = rospy.get_param("~cmd_vy_sign", 1.0)  # +1 标准：+Y向左；若物理接线反，设 -1
+        self.cmd_vx_sign = rospy.get_param("~cmd_vx_sign", 1.0)  # 若底盘接线/固件把X反了，就设为 -1.0
+
 
         # 目标与对齐
         self.target_dist = rospy.get_param("~target_dist", 0.60)
@@ -132,8 +134,8 @@ class WallFollower:
         self._soft_gate = 0.0
 
         # === 车体尺寸 & 转弯需求 ===
-        self.robot_L = rospy.get_param("~robot_length", 1.20)
-        self.robot_W = rospy.get_param("~robot_width",  1.00)
+        self.robot_L = rospy.get_param("~robot_length", 0.20)
+        self.robot_W = rospy.get_param("~robot_width",  0.20)
         self.turn_padding = rospy.get_param("~turn_padding", 0.15)  # 包络圆安全余量
         self.R_turn_need = 0.5*math.hypot(self.robot_L, self.robot_W) + self.turn_padding
         rospy.loginfo("[TURN] R_turn_need=%.3fm (L=%.2f W=%.2f pad=%.2f)",
@@ -148,10 +150,26 @@ class WallFollower:
         self.side_extra = rospy.get_param("~turn_side_extra", 0.05)  # 侧向再多预留一点
         self.left_safe_extra = rospy.get_param("~left_safe_extra", 0.30)  # 左侧可用最小空间冗余（避免侧移撞左）
 
+        # ==== 极简角点 FSM 额外参数（新增） ====
+        self.c_forward_need_extra = rospy.get_param("~corner_forward_need_extra", 0.05)  # 前向比 R_need 多预留
+        self.c_side_need_extra    = rospy.get_param("~corner_side_need_extra",    0.05)  # 对侧比 R_need 多预留
+        self.c_front_safe_floor   = rospy.get_param("~front_safe_floor",          0.40)  # 前向硬安全地板
+        self.c_step_vy            = rospy.get_param("~corner_step_vy",            0.18)  # 侧移速度 m/s
+        self.c_back_vx            = rospy.get_param("~corner_back_vx",            0.12)  # 后退速度 m/s
+        self.c_max_step_out       = rospy.get_param("~corner_max_step_out",       0.30)  # 最大侧移距离（可选）
+        self.c_use_odom_y         = rospy.get_param("~corner_use_odom_y",         True) # 若要用里程计y限幅
+
+        # 把角点状态重置为极简版本的初值
+        self.corner_state   = "C_IDLE"     # C_IDLE / C_STEP_OUT / C_TURN / C_COOL
+        self._c_t_enter     = 0.0
+        self._c_yaw_start   = None
+        self._c_step_y0     = None
+
+
         # === 角点 FSM 参数 ===
         self.corner_trigger_dist = rospy.get_param("~corner_trigger_dist", 1.20)
         self.corner_reset_dist   = rospy.get_param("~corner_reset_dist",   1.30)
-        self.corner_turn_speed   = rospy.get_param("~corner_turn_speed",   0.6)  # rad/s
+        self.corner_turn_speed   = rospy.get_param("~corner_turn_speed",   1.0)  # rad/s 0.6
         self.corner_turn_angle   = rospy.get_param("~corner_turn_angle",   pi/2)
         self.corner_cooldown     = rospy.get_param("~corner_cooldown",     4.0)
         self.corner_forward_only = rospy.get_param("~corner_forward_only", True)
@@ -164,7 +182,7 @@ class WallFollower:
         self.turn_yaw_tol_deg = rospy.get_param("~turn_yaw_tol_deg", 6.0)
         self.turn_hold_frames = rospy.get_param("~turn_hold_frames", 3)
         self.turn_exit_extra_m= rospy.get_param("~turn_exit_extra_m", 0.30)
-        self.turn_max_time    = rospy.get_param("~turn_max_time", 6.0)
+        self.turn_max_time    = rospy.get_param("~turn_max_time", 13.0) # turns timing, it is 6 in the begining
 
         # === 访问记忆（可关闭） ===
         self.visited_enable   = rospy.get_param("~visited_enable", True)
@@ -188,6 +206,9 @@ class WallFollower:
         rospy.Subscriber("/corner_point",   PointStamped, self.cb_corner_pt, queue_size=1)
         rospy.Subscriber("/front_min",      Float32, self.cb_front_min,   queue_size=1)
         rospy.Subscriber("/left_min",       Float32, self.cb_left_min,    queue_size=1)
+        self.right_min = float('nan')
+        rospy.Subscriber("/right_min", Float32, lambda m: setattr(self, "right_min", float(m.data)), queue_size=1)
+
 
         self.csvf = open(self.log_path, "w", newline="")
         self.csv = csv.writer(self.csvf)
@@ -214,7 +235,7 @@ class WallFollower:
 
         # 角点相关运行态
         self.corner_has = False; self.corner_pt = None; self.corner_dist = float('nan')
-        self.corner_state = "IDLE"  # IDLE / SPRAY_EDGE / STAGE_OPEN / STAGE_STEP_OUT / APPROACH_STOP / TURNING / COOLDOWN
+        #self.corner_state = "IDLE"  # IDLE / SPRAY_EDGE / STAGE_OPEN / STAGE_STEP_OUT / APPROACH_STOP / TURNING / COOLDOWN
         self.corner_prepare_end = 0.0
         self.corner_turn_end_time = 0.0
         self.corner_cool_end_time = 0.0
@@ -238,6 +259,8 @@ class WallFollower:
         self.tf_buf = tf2_ros.Buffer(); self.tf_lst = tf2_ros.TransformListener(self.tf_buf)
         self.base_frame = rospy.get_param("~base_frame", "base_link")
         self.odom_frame = rospy.get_param("~odom_frame", "odom")
+
+
 
     # ---------- 订阅回调 ----------
     def cb_wall_yaw(self, msg):
@@ -265,6 +288,14 @@ class WallFollower:
         self.front_min = float(msg.data)
     def cb_left_min(self, msg):
         self.left_min = float(msg.data)
+    def _is_wall_following_simple(self):
+        """
+        简单判断当前确实在“贴墙走”（用于避免误触发拐角）：
+        有墙、侧距可用，且 |侧距-目标| <= 容差
+        """
+        if (self.has_wall) and (self.wall_dist == self.wall_dist):
+            return abs(self.wall_dist - self.target_dist) <= (self.align_tol_d + 0.02)
+        return False
 
     # ---------- 状态管理 ----------
     def set_state(self, new_state, reason=""):
@@ -287,7 +318,7 @@ class WallFollower:
                               else max(0.0, self._soft_gate - self.soft_down)
         else:
             self._soft_gate = 1.0 if mag > 1e-6 else 0.0
-        vx_out = vx_l * self._soft_gate
+        vx_out = self.cmd_vx_sign * vx_l * self._soft_gate
         vy_out = self.cmd_vy_sign * vy_l * self._soft_gate
         wz_out = wz_l * self._soft_gate
         cmd = Twist(); cmd.linear.x=vx_out; cmd.linear.y=vy_out; cmd.angular.z=wz_out
@@ -334,182 +365,118 @@ class WallFollower:
 
     # ---------- 角点子状态机（唯一拐角逻辑） ----------
     def corner_fsm(self):
+        """
+        极简角点 FSM：只用 front_min + 对侧最小距离（右墙时=left_min）+ 车体包络 R_turn_need
+        四阶段：C_IDLE → C_STEP_OUT → C_TURN → C_COOL
+        逻辑只保证“贴右墙”完备（side='right'）；贴左墙需要 /right_min 话题或自行对称实现。
+        返回值：True=由拐角流程接管控制（本周期跳过主状态机）；False=不接管。
+        """
         now = rospy.Time.now().to_sec()
+        side = self.side  # 'right' / 'left'
 
-        # === TURNING ===
-        if self.corner_state == "TURNING":
-            wsign = -1.0 if self.side == "right" else +1.0  # 右墙→右转（顺时针），左墙→左转（逆时针）
-            self._publish(0.0, 0.0, wsign * self.corner_turn_speed, "CORNER_TURNING")
-            done = False
-            # 1) 墙朝向到位
-            if (self.turn_yaw_target is not None) and (self.wall_yaw == self.wall_yaw):
-                err = abs(ang_wrap(self.wall_yaw - self.turn_yaw_target))
-                if err <= (self.turn_yaw_tol_deg * np.pi/180.0):
-                    self.turn_hold_cnt += 1
-                else:
-                    self.turn_hold_cnt = 0
-                if self.turn_hold_cnt >= self.turn_hold_frames:
-                    rospy.loginfo("[CORNER] 墙朝向到位 err=%.1f° 连续%d帧", err*180.0/np.pi, self.turn_hold_frames)
-                    done = True
-            # 2) 位置退出（角点到身侧/身后 或 距离足够远）
-            if (not done) and (self.corner_pt is not None):
-                cx, cy = self.corner_pt
-                dist_exit = (self.corner_trigger_dist + self.turn_exit_extra_m)
-                side_ok = ((self.side=="right" and (cx < 0.0) and (cy < -(self.target_dist+0.10))) or
-                           (self.side=="left"  and (cx < 0.0) and (cy >  (self.target_dist+0.10))))
-                far_ok  = (self.corner_dist > dist_exit)
-                if side_ok or far_ok:
-                    rospy.loginfo("[CORNER] 角点退出：%s%s",
-                                  "身侧/身后 " if side_ok else "",
-                                  "距离>%.2fm" % dist_exit if far_ok else "")
-                    done = True
-            # 3) 兜底超时
-            if (not done) and (now >= self.corner_turn_end_time or (now - (self.corner_turn_end_time - 9999)) > self.turn_max_time):
-                rospy.logwarn("[CORNER] 兜底超时，强制结束转弯")
-                done = True
-            if done:
-                self.corner_state = "COOLDOWN"
-                self.corner_cool_end_time = now + self.corner_cooldown
-                self.turn_yaw_start = None; self.turn_yaw_target = None; self.turn_hold_cnt = 0; self._yaw_buf[:] = []
-                self.set_state("ALIGN", "CORNER_TURN_DONE"); self.stop("CORNER_TURN_DONE")
-            return True
+        # ---- 取需要的传感量 ----
+        front = self.front_min
+        # 右墙场景下，对侧距离=left_min；左墙场景需要 right_min（本版本未订阅）
+        opp_min = self.left_min if self.side == "right" else self.right_min
 
-        # === COOLDOWN ===
-        if self.corner_state == "COOLDOWN":
-            if now < self.corner_cool_end_time:
-                return False
-            else:
-                self.corner_state = "IDLE"; self.corner_armed=False; self.corner_arm_cnt=0; self.corner_prev_dist=None
-                rospy.loginfo("[CORNER] 冷却结束，回到 IDLE（解除武装）")
-                return False
 
-        # === APPROACH_STOP（预停）===
-        if self.corner_state == "APPROACH_STOP":
-            if now < self.corner_prepare_end:
-                for _ in range(int(self.corner_brake_times)):
-                    self.stop("CORNER_PREPARE_STOP")
-                return True
-            else:
-                yaw_start = np.median(self._yaw_buf) if len(self._yaw_buf) > 0 else self.wall_yaw
-                self.turn_yaw_start = yaw_start
-                turn_sign = -1.0 if self.side == "right" else +1.0
-                self.turn_yaw_target = ang_wrap(yaw_start + turn_sign * (np.pi/2.0))
-                self.turn_hold_cnt = 0
-                t_need = abs(self.corner_turn_angle) / max(0.1, abs(self.corner_turn_speed))
-                self.corner_turn_end_time = now + max(t_need, 1.5)
-                self.corner_state = "TURNING"
-                rospy.loginfo("[CORNER] 开始转弯 90.0° 目标yaw=%.1f°", self.turn_yaw_target*180.0/np.pi)
-                self.stop("CORNER_TURN_BEGIN")
-                return True
+        # ---- 需求空间 ----
+        need_side  = self.R_turn_need + self.c_side_need_extra
+        need_front = self.R_turn_need + self.c_forward_need_extra
 
-        # === STAGE_STEP_OUT（侧移让位，直到侧距 ≥ R_need）===
-        if self.corner_state == "STAGE_STEP_OUT":
-            # 侧移目标：
-            need = (self.R_turn_need + self.side_extra) - (self.wall_dist if self.wall_dist==self.wall_dist else 0.0)
-            if (need <= 0.0):
-                rospy.loginfo("[CORNER] 侧向让位完成 (侧距≥R_need) → 预停")
-                self.corner_prepare_end = now + self.corner_prepare_t
-                self.corner_state = "APPROACH_STOP"
-                self.stop("CORNER_PREPARE")
-                return True
+        # ---- 取当前 yaw ----
+        _, _, yaw = self._get_pose_odom()
 
-            # 左侧空间足够吗（右墙场景）？
-            if self.side == "right":
-                if self.left_min == self.left_min and self.left_min < (need + self.left_safe_extra):
-                    # 左侧空间不足 → 再尝试前探一会
-                    if (now - self.stage_start_t) < self.stage_timeout:
-                        self._publish(self.stage_vx, 0.0, 0.0, "STAGE_OPEN_RETRY(left tight)")
-                        return True
-                    else:
-                        rospy.logwarn("[CORNER] 左侧空间不足且超时，放弃角点，交还主状态机")
-                        self.corner_state = "IDLE"
-                        return False
-                # 可以侧移：按里程计 y 做闭环
-                if self.stage_start_y is None:
-                    _, y0, _ = self._get_pose_odom(); self.stage_start_y = y0
-                _, yk, _ = self._get_pose_odom()
-                dy = (yk - self.stage_start_y) if (yk==yk and self.stage_start_y==self.stage_start_y) else 0.0
-                remain = need - max(0.0, dy)
-                vy = +self.stage_vy  # 向左
-                if remain < 0.20:  # 临近目标时减速
-                    vy *= 0.5
-                self._publish(0.02, vy, 0.0, f"STAGE_STEP_OUT(dy={dy:.2f}/need={need:.2f})")
+        # ========== C_IDLE：检测是否接近角点 ==========
+        if self.corner_state == "C_IDLE":
+            if (front == front) and (front < self.corner_trigger_dist) and self._is_wall_following_simple():
+                self.corner_state = "C_STEP_OUT"
+                self._c_t_enter   = now
+                self._c_yaw_start = yaw
+                self._c_step_y0   = None
+                self.stop("C_IDLE->C_STEP_OUT")  # 预停一帧
                 return True
-            else:
-                # 贴左墙时 → 检查右侧空间，向右侧移（vy为负）
-                # 这里为了简洁，先仅实现右墙需求；若要左墙同理复制一份对称逻辑
-                self._publish(0.0, 0.0, 0.0, "STAGE_STEP_OUT(left side TODO)")
-                return True
-
-        # === STAGE_OPEN（前探找空地，直到前方≥R_need 或 角点在身后）===
-        if self.corner_state == "STAGE_OPEN":
-            open_ok = (self.front_min == self.front_min) and (self.front_min >= (self.R_turn_need + 0.05))
-            passed  = (self.corner_pt is not None) and (self.corner_pt[0] <= -self.corner_pass_x)
-            if open_ok or passed:
-                rospy.loginfo("[CORNER] 已到空地（front>=R 或 apex在身后）→ 侧移让位")
-                self.corner_state = "STAGE_STEP_OUT"
-                self.stage_start_t = now
-                self.stage_start_y = None
-                return True
-            if (now - self.stage_start_t) > self.stage_timeout:
-                rospy.logwarn("[CORNER] 前探超时，放弃角点，交还主状态机")
-                self.corner_state = "IDLE"
-                return False
-            # 继续前探，轻微贴墙纠偏
-            vx = self.stage_vx
-            vy = 0.0; wz = 0.0
-            if self.has_wall and not isnan(self.wall_dist) and not isnan(self.wall_yaw):
-                e_d = self.target_dist - self.wall_dist
-                side_dir = +1.0 if (self.side=="right") else -1.0
-                vy = sat(side_dir * self.k_vy_go * e_d, -self.max_vy_go, self.max_vy_go)
-                e_yaw = -self.wall_yaw
-                wz = sat(self.k_w_go * e_yaw, -self.max_w_go, self.max_w_go)
-            self._publish(vx, vy, wz, "STAGE_OPEN")
-            return True
-
-        # === SPRAY_EDGE（喷到边：前距≤喷 reach 即认为边缘已覆盖）===
-        if self.corner_state == "SPRAY_EDGE":
-            # 判据：前向最小距离 ≤ 喷到边阈值
-            if (self.front_min == self.front_min) and (self.front_min <= self.spray_front_reach):
-                rospy.loginfo("[CORNER] 喷到边(front<=%.2f) → 前探找空地", self.spray_front_reach)
-                self.corner_state = "STAGE_OPEN"
-                self.stage_start_t = now
-                return True
-            # 继续贴墙走并轻微纠偏
-            vx = self.forward_speed
-            vy = 0.0; wz = 0.0
-            if self.has_wall and not isnan(self.wall_dist) and not isnan(self.wall_yaw):
-                e_d = self.target_dist - self.wall_dist
-                side_dir = +1.0 if (self.side=="right") else -1.0
-                vy = sat(side_dir * self.k_vy_go * e_d, -self.max_vy_go, self.max_vy_go)
-                e_yaw = -self.wall_yaw
-                wz = sat(self.k_w_go * e_yaw, -self.max_w_go, self.max_w_go)
-            self._publish(vx, vy, wz, "SPRAY_EDGE")
-            return True
-
-        # === IDLE：检测触发 → 进入 SPRAY_EDGE ===
-        if self.corner_state == "IDLE" and self.corner_has and (self.corner_pt is not None):
-            dist = self.corner_dist
-            if self.corner_forward_only and self.corner_pt[0] <= 0.0:
-                self.corner_prev_dist = dist; return False
-            # “武装”防抖
-            if dist > self.corner_reset_dist:
-                self.corner_arm_cnt += 1
-                if self.corner_arm_cnt >= self.corner_arm_samples:
-                    self.corner_armed = True
-            else:
-                self.corner_arm_cnt = 0
-            can_trigger_by_state = (self.state in self.corner_trigger_in_states)
-            moving_forward = (abs(self.current_vx) > self.corner_min_vx_to_trigger)
-            decreasing = (self.corner_prev_dist is not None) and ((self.corner_prev_dist - dist) > self.corner_trend_eps)
-            if self.corner_armed and can_trigger_by_state and moving_forward and decreasing and (dist < self.corner_trigger_dist):
-                self.corner_state = "SPRAY_EDGE"
-                self.corner_armed = False; self.corner_arm_cnt = 0
-                rospy.loginfo("[CORNER] 触发@%.2fm → SPRAY_EDGE", dist)
-                return True
-            self.corner_prev_dist = dist
             return False
 
+        # ========== C_STEP_OUT：向对侧侧移 + 必要时小幅后退 ==========
+        if self.corner_state == "C_STEP_OUT":
+            # 满足条件：对侧≥need_side 且 前方≥need_front → 进入转弯
+            ok_side  = (opp_min == opp_min) and (opp_min >= need_side)
+            ok_front = (front   == front)   and (front   >= need_front)
+            if ok_side and ok_front:
+                self.corner_state = "C_TURN"
+                self._c_t_enter   = now
+                self._c_yaw_start = yaw
+                self.stop("STEP_OUT->TURN")
+                return True
+
+            # 前方过近 → 小幅后退（硬地板 or 比R_turn_need略小）
+            vx = 0.0
+            if (front == front) and (front < max(self.c_front_safe_floor, self.R_turn_need - 0.10)):
+                vx = -self.c_back_vx
+
+            # 侧移到对侧：右墙→+Y（opp_sign=+1），左墙→-Y（本版未对称实现 right_min）
+            opp_sign = +1.0 if side == "right" else -1.0
+            vy = opp_sign * self.c_step_vy
+            wz = 0.0
+
+            if (now - self._c_t_enter) > 3.0:
+                # Try turning anyway, or fall back to HOLD
+                self.corner_state = "C_TURN"
+                self._c_t_enter   = now
+                self._c_yaw_start = yaw
+                self.stop("STEP_OUT_TIMEOUT->TURN")
+                return True
+
+            # 可选：用里程计y限幅，防止侧移过头
+            if self.c_use_odom_y:
+                ox, oy, _ = self._get_pose_odom()
+                if (oy == oy):
+                    if self._c_step_y0 is None:
+                        self._c_step_y0 = oy
+                    if abs(oy - self._c_step_y0) >= self.c_max_step_out:
+                        # 侧移到上限仍未满足 → 直接尝试进入转弯（也可改成放弃）
+                        self.corner_state = "C_TURN"
+                        self._c_t_enter   = now
+                        self._c_yaw_start = yaw
+                        self.stop("STEP_OUT_LIMIT->TURN")
+                        return True
+
+            self._publish(vx, vy, wz, f"STEP_OUT(opp {opp_min:.2f}/{need_side:.2f}, front {front:.2f}/{need_front:.2f})")
+            return True
+
+        # ========== C_TURN：原地 90° ==========
+        if self.corner_state == "C_TURN":
+            # 右墙→右转（顺时针，负角速度），左墙→左转（逆时针，正角速度）
+            target = -np.pi/2 if side == "right" else +np.pi/2
+            # 以“相对进入时的Δyaw”为控制量
+            def wrap(a): return (a + np.pi) % (2*np.pi) - np.pi
+            d_yaw = wrap(yaw - (self._c_yaw_start if self._c_yaw_start is not None else yaw))
+            err   = wrap(d_yaw - target)
+
+            # 结束条件：角度到位 or 兜底超时
+            if abs(err) <= (self.turn_yaw_tol_deg*np.pi/180.0) or (now - self._c_t_enter) >= self.turn_max_time:
+                self.corner_state = "C_COOL"
+                self._c_t_enter   = now
+                self.stop("TURN->COOL")
+                return True
+
+            wz = (-1.0 if side == "right" else +1.0) * self.corner_turn_speed
+            self._publish(0.0, 0.0, wz, f"TURN({np.rad2deg(err):.1f}deg)")
+            return True
+
+        # ========== C_COOL：冷却 ==========
+        if self.corner_state == "C_COOL":
+            if (now - self._c_t_enter) >= self.corner_cooldown:
+                self.corner_state = "C_IDLE"
+                self.stop("COOL->IDLE")
+                return False  # 冷却完毕，释放控制
+            else:
+                self.stop("COOL")
+                return True
+
+        # 兜底复位
+        self.corner_state = "C_IDLE"
         return False
 
     # ---------- 主循环 ----------
@@ -524,8 +491,8 @@ class WallFollower:
                 rate.sleep(); continue
 
             # 可选安全：前障直接减速/停车
-            if self.obs_front:
-                self.stop("SAFE_STOP_OBS_FRONT"); rate.sleep(); continue
+            #if self.obs_front:
+            #    self.stop("SAFE_STOP_OBS_FRONT"); rate.sleep(); continue
 
             # 主状态机
             if self.state == "ALIGN":
@@ -597,7 +564,7 @@ class WallFollower:
             pass
 
 if __name__ == "__main__":
-    rospy.init_node("bug2_lock_v3")
+    rospy.init_node("bug2_lock_v4")
     WallFollower().run()
 
 

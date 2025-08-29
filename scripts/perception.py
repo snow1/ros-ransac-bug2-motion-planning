@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+perception_user_opt.py
+- Keeps your original logic and RViz visuals (sector outline, wall line, corner sphere)
+- Publishes: /wall_angle, /wall_lateral, /wall_quality, /wall_has, /obstacle_ahead,
+             /corner_has, /corner_point   (base_link), and NEW: /front_min, /left_min, /right_min
+- Always publishes booleans each scan (no silent frames)
+- Optional "front wedge" only for the second line (corner) so you can narrow main sector later
+"""
+
 import rospy
 import numpy as np
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Float32, Bool
+from std_msgs.msg import Float32, Bool, Header
 from visualization_msgs.msg import Marker
 from geometry_msgs.msg import Point, PointStamped
 import tf2_ros
@@ -19,26 +28,25 @@ class WallPerception:
         self.side = rospy.get_param("~side", "right")  # right / left
         self.sector_center_deg = rospy.get_param("~sector_center_deg", -90.0 if self.side=="right" else 90.0)
         self.sector_width_deg  = rospy.get_param("~sector_width_deg", 160.0)
-        self.r_min = rospy.get_param("~r_min", 0.12)
+        self.r_min = rospy.get_param("~r_min", 0.3)#最小量测距离（米），默认 0.12 m。距离小于它的点被视为无效（例如近端噪声、底盘反射）。
         self.r_max = rospy.get_param("~r_max", 8.0)
         self.min_points = rospy.get_param("~min_points", 30)
 
         # 质量门槛（主墙线，仅用于“宣布有墙”）
         self.min_span   = rospy.get_param("~min_span", 0.25)
-        self.min_quality_keep = rospy.get_param("~min_quality_keep", 3.0)  # 弱时维持几帧
+        self.min_quality_keep = rospy.get_param("~min_quality_keep", 3.0)  # 弱时维持几帧（用于早期版本兼容）
 
-        # 前向避障
+        # 前向避障（布尔）
         self.front_stop = rospy.get_param("~front_stop", 0.55)
 
         # EMA 平滑
         self.ema_alpha_angle = rospy.get_param("~ema_alpha_angle", 0.3)
         self.ema_alpha_dist  = rospy.get_param("~ema_alpha_dist", 0.3)
 
-        # RViz 可视化
+        # RViz 可视化（保留）
         self.marker_frame = rospy.get_param("~marker_frame", "laser")  # 也可 base_link/map
         self.draw_length  = rospy.get_param("~draw_length", 1.0)       # 墙线显示长度（不影响算法）
-        # 计算扇区轮廓可视化（你要求“不要删掉”——保留）
-        self.draw_sector = rospy.get_param("~draw_sector", True)
+        self.draw_sector = rospy.get_param("~draw_sector", True)        # 计算扇区轮廓可视化
         self.sector_edge_count = rospy.get_param("~sector_edge_count", 48)
 
         # RANSAC 参数（可在 launch 里调）
@@ -59,6 +67,19 @@ class WallPerception:
         self.corner_require_forward = rospy.get_param("~corner_require_forward", True)
         self.corner_y_tol = rospy.get_param("~corner_y_tol", 0.10)
 
+        # === 新增：角点前探楔形扇区，仅用于“次线/角点”（可关）===
+        self.corner_front_enable = rospy.get_param("~corner_front_enable", True)
+        self.corner_front_center_deg = rospy.get_param(
+            "~corner_front_center_deg", -30.0 if self.side=="right" else +30.0)
+        self.corner_front_width_deg  = rospy.get_param("~corner_front_width_deg", 50.0)
+
+        # === 新增：给 bug2_v4 的净空指标（v3 不依赖） ===
+        self.front_width_deg = rospy.get_param("~front_width_deg", 40.0)   # ±20°
+        self.side_width_deg  = rospy.get_param("~side_width_deg", 60.0)    # 左右各±30°
+
+        # 可选：为布尔话题加 latch，便于新订阅者立即获得状态
+        self.latch_bools = rospy.get_param("~latch_bools", False)
+
         # TF
         self.tf_buf = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buf)
@@ -66,16 +87,21 @@ class WallPerception:
         # ---------------- 发布者 ----------------
         self.pub_angle   = rospy.Publisher("/wall_angle",   Float32, queue_size=10)
         self.pub_lateral = rospy.Publisher("/wall_lateral", Float32, queue_size=10)
-        self.pub_quality = rospy.Publisher("/wall_quality", Float32, queue_size=10)  # 这里用“内点数”作简化质量
-        self.pub_has     = rospy.Publisher("/wall_has",     Bool,    queue_size=10)
+        self.pub_quality = rospy.Publisher("/wall_quality", Float32, queue_size=10)  # 用“内点数”作质量
+        self.pub_has     = rospy.Publisher("/wall_has",     Bool,    queue_size=10, latch=self.latch_bools)
         self.pub_obs     = rospy.Publisher("/obstacle_ahead", Bool,  queue_size=10)
 
-        # 角点话题（新增但你之前就需要）
-        self.pub_corner_has = rospy.Publisher("/corner_has", Bool, queue_size=10)
+        # 角点话题（保持）
+        self.pub_corner_has = rospy.Publisher("/corner_has", Bool, queue_size=10, latch=self.latch_bools)
         self.pub_corner_pt  = rospy.Publisher("/corner_point", PointStamped, queue_size=10)
 
-        # Marker 发布
+        # RViz Marker 发布（保持）
         self.pub_marker  = rospy.Publisher("visualization_marker", Marker, queue_size=20)
+
+        # 新增：净空最小距离（供 bug2_v4 使用；v3 忽略）
+        self.pub_front   = rospy.Publisher("/front_min",  Float32, queue_size=10)
+        self.pub_left    = rospy.Publisher("/left_min",   Float32, queue_size=10)
+        self.pub_right   = rospy.Publisher("/right_min",  Float32, queue_size=10)
 
         # 状态
         self.angle_s = None
@@ -86,7 +112,7 @@ class WallPerception:
 
     # ---------------- 工具 ----------------
     def _hdr(self):
-        h = rospy.Header()
+        h = Header()
         h.stamp = rospy.Time.now()
         h.frame_id = self.marker_frame
         return h
@@ -105,7 +131,15 @@ class WallPerception:
         except (tf2_ros.LookupException, tf2_ros.ExtrapolationException):
             return None
 
-    # ---------------- 可视化：扇区轮廓（保留你要的“LiDAR 计算区域”） ----------------
+    # --- 新增：某扇区（中心/宽度）最小距离 ---
+    def _sector_min(self, angles, ranges, valid, center_deg, width_deg):
+        c = np.deg2rad(center_deg); half = np.deg2rad(width_deg*0.5)
+        m = valid & (np.abs(wrap(angles - c)) <= half)
+        if not np.any(m):
+            return float('nan')
+        return float(np.nanmin(ranges[m]))
+
+    # ---------------- 可视化：扇区轮廓（保留） ----------------
     def _publish_sector_outline(self, center_rad, half_rad):
         if not self.draw_sector:
             return
@@ -137,7 +171,7 @@ class WallPerception:
         mk.lifetime = rospy.Duration(0.3)
         self.pub_marker.publish(mk)
 
-    # ---------------- RANSAC 直线拟合（返回：模型与内点“索引”） ----------------
+    # ---------------- RANSAC 直线拟合（返回：模型与内点索引） ----------------
     def fit_line_ransac(self, pts, iters, thresh, min_inliers):
         n = len(pts)
         if n < max(2, min_inliers):
@@ -174,7 +208,7 @@ class WallPerception:
         nrm = np.array([-v[1], v[0]])
         return (c, v, nrm), best_inliers
 
-    # ---------------- RViz 绘制 ----------------
+    # ---------------- RViz 绘制（保留） ----------------
     def _draw_line(self, c, v, color=(0.0,1.0,0.0,1.0), mid_id=1):
         L = max(0.5, float(self.draw_length))  # 固定长度显示更直观
         p1 = c - v*(L*0.5)
@@ -218,19 +252,27 @@ class WallPerception:
         ranges = np.array(msg.ranges, dtype=np.float32)
         valid = np.isfinite(ranges) & (ranges > self.r_min) & (ranges < self.r_max)
 
-        # 前方障碍
+        # 前方障碍（布尔）
         self.pub_obs.publish(self._front_obstacle(angles, ranges, valid))
 
-        # 扇区筛选 + 扇区可视化（不要删！）
+        # 新增：扇区最小距离（Float32；可能为 NaN）
+        fmin = self._sector_min(angles, ranges, valid, 0.0,   self.front_width_deg)
+        lmin = self._sector_min(angles, ranges, valid, +90.0, self.side_width_deg)
+        rmin = self._sector_min(angles, ranges, valid, -90.0, self.side_width_deg)
+        self.pub_front.publish(float(fmin))
+        self.pub_left .publish(float(lmin))
+        self.pub_right.publish(float(rmin))
+
+        # 扇区筛选 + 扇区可视化（保留）
         center = np.deg2rad(self.sector_center_deg)
         half   = np.deg2rad(self.sector_width_deg*0.5)
         self._publish_sector_outline(center, half)
 
         m = valid & (np.abs(wrap(angles - center)) <= half)
         if m.sum() < self.min_points:
-            if self.quality_s < self.min_quality_keep:
-                self.pub_has.publish(False)
-                self.pub_corner_has.publish(False)
+            # 明确发布“没有墙/没有角点”，避免控制端看到“沉默帧”
+            self.pub_has.publish(False)
+            self.pub_corner_has.publish(False)
             return
 
         a = angles[m]; r = ranges[m]
@@ -265,7 +307,7 @@ class WallPerception:
             self.dist_s  = (1-self.ema_alpha_dist)*self.dist_s + self.ema_alpha_dist*d
             self.quality_s = 0.8*self.quality_s + 0.2*quality
 
-        # 发布
+        # 发布主墙信息（bug2_v3/v4 都会用到）
         self.pub_has.publish(True)
         self.pub_angle.publish(self.angle_s)
         self.pub_lateral.publish(self.dist_s)
@@ -279,6 +321,18 @@ class WallPerception:
         remain_mask = np.ones(len(pts), dtype=bool)
         remain_mask[in1_idx] = False
         remain = pts[remain_mask]
+
+        # 可选：把“前探楔形扇区”的点并入次线候选，提升角点提前量
+        if self.corner_front_enable:
+            cdeg = self.corner_front_center_deg
+            wdeg = self.corner_front_width_deg
+            cfr = np.deg2rad(cdeg); hfr = np.deg2rad(wdeg*0.5)
+            m_front = valid & (np.abs(wrap(angles - cfr)) <= hfr)
+            if np.any(m_front):
+                rf = ranges[m_front]; af = angles[m_front]
+                pts_front = np.stack([rf*np.cos(af), rf*np.sin(af)], axis=1)
+                if pts_front.size:
+                    remain = np.vstack([remain, pts_front]) if remain.size else pts_front
 
         corner_found = False
         corner_xy = None
@@ -295,12 +349,14 @@ class WallPerception:
                 in2_pts = remain[in2_idx]
                 c2tmp = in2_pts.mean(axis=0)
                 X2tmp = in2_pts - c2tmp
-                v2tmp = np.linalg.svd(X2tmp, full_matrices=False)[2][0]
+                v2tmp = np.linalg.svd(X2tmp, full_matrices=False)[2][0]  # principal dir
                 span2 = float((X2tmp @ v2tmp).ptp())
                 inlier_ratio2 = in2_idx.size / float(remain.shape[0])
                 if (span2 >= self.corner_min_span2) and (inlier_ratio2 >= self.corner_min_inlier_ratio2):
                     # 夹角
-                    ang = np.degrees(np.arccos(np.clip(abs(np.dot(v1/np.linalg.norm(v1), v2/np.linalg.norm(v2))), -1, 1)))
+                    v1u = v1 / (np.linalg.norm(v1) + 1e-9)
+                    v2u = v2 / (np.linalg.norm(v2) + 1e-9)
+                    ang = np.degrees(np.arccos(np.clip(abs(np.dot(v1u, v2u)), -1, 1)))
                     if self.corner_ang_min_deg <= ang <= self.corner_ang_max_deg:
                         # 求交点：c1 + t v1 = c2 + s v2
                         A = np.array([v1, -v2]).T
@@ -331,7 +387,7 @@ class WallPerception:
             self._draw_corner(corner_xy)
             self.pub_corner_has.publish(True)
 
-              ### 修改：在 base_link 下发布角点 ###
+            # 在 base_link 下发布角点
             try:
                 tf = self.tf_buf.lookup_transform("base_link", "laser", rospy.Time(0), rospy.Duration(0.05))
                 tmp = PointStamped()
@@ -349,7 +405,7 @@ class WallPerception:
         else:
             self.pub_corner_has.publish(False)
 
-    # ---------------- 前向障碍检测 ----------------
+    # ---------------- 前向障碍检测（保留） ----------------
     def _front_obstacle(self, ang, rng, valid):
         front = (np.abs(ang) <= np.deg2rad(20.0)) & valid
         return bool(np.nanmin(rng[front]) < self.front_stop) if np.any(front) else False

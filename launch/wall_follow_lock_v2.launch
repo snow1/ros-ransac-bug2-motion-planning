@@ -3,7 +3,7 @@
 
 <!-- static_transform_publisher x y z yaw pitch roll frame_id child_frame_id period_in_ms  rostopic echo -n5 /wall_angle -->
  <node pkg="tf" type="static_transform_publisher" name="base_to_laser"
-        args="0.2494 -0.3553 0.8500  0 0 0  base_link laser 50"/>
+        args="0 0 0  0 0 0  base_link laser 50"/>
 
 
 
@@ -15,14 +15,14 @@
 
   <!-- 感知（RANSAC+质量指标） -->
   <node pkg="ransacbug2" type="perception.py" name="perception_lock_v2" output="screen">
-    <param name="side" value="right"/>
+    <param name="side" value="left"/>
     <param name="scan_topic" value="/scan"/>
 
   </node>
 
   <!-- 控制（ALIGN→LOCKED_GO→HOLD） -->
-  <node pkg="ransacbug2" type="bug2_lock_v2.py" name="bug2_lock_v2" output="screen">
-    <param name="side" value="right"/>
+  <node pkg="ransacbug2" type="bug2_lock_v3.py" name="bug2_lock_v3" output="screen">
+    <param name="side" value="left"/>
     <param name="state" value="ALIGN"/>
     <param name="scan_topic" value="/scan"/>
     <param name="cmd_vel_topic" value="/cmd_vel"/>
