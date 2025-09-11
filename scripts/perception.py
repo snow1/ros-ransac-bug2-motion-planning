@@ -27,7 +27,7 @@ class WallPerception:
         self.scan_topic = rospy.get_param("~scan_topic", "/scan")
         self.side = rospy.get_param("~side", "right")  # right / left
         self.sector_center_deg = rospy.get_param("~sector_center_deg", -90.0 if self.side=="right" else 90.0)
-        self.sector_width_deg  = rospy.get_param("~sector_width_deg", 160.0)
+        self.sector_width_deg  = rospy.get_param("~sector_width_deg", 150.0)
         self.r_min = rospy.get_param("~r_min", 0.3)#最小量测距离（米），默认 0.12 m。距离小于它的点被视为无效（例如近端噪声、底盘反射）。
         self.r_max = rospy.get_param("~r_max", 8.0)
         self.min_points = rospy.get_param("~min_points", 30)
@@ -64,11 +64,11 @@ class WallPerception:
         self.corner_ang_max_deg = rospy.get_param("~corner_ang_max_deg", 110.0)
 
         # 角点“位置约束”（右墙时在右前，左墙时在左前），给一点容差
-        self.corner_require_forward = rospy.get_param("~corner_require_forward", True)
+        self.corner_require_forward = rospy.get_param("~corner_require_forward", False)
         self.corner_y_tol = rospy.get_param("~corner_y_tol", 0.10)
 
         # === 新增：角点前探楔形扇区，仅用于“次线/角点”（可关）===
-        self.corner_front_enable = rospy.get_param("~corner_front_enable", True)
+        self.corner_front_enable = rospy.get_param("~corner_front_enable", False)
         self.corner_front_center_deg = rospy.get_param(
             "~corner_front_center_deg", -30.0 if self.side=="right" else +30.0)
         self.corner_front_width_deg  = rospy.get_param("~corner_front_width_deg", 50.0)
