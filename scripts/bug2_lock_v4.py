@@ -85,21 +85,21 @@ class WallFollower:
         # ========== ROBOT GEOMETRY & TURN NEED ==========
         self.robot_L = rospy.get_param("~robot_length", 1.00)
         self.robot_W = rospy.get_param("~robot_width",  0.66)
-        self.turn_padding = rospy.get_param("~turn_padding", 0.22)
+        self.turn_padding = rospy.get_param("~turn_padding", 0.52)#0.22
         self.R_turn_need = 0.5*math.hypot(self.robot_L, self.robot_W) + self.turn_padding
 
         # ========== CORNER FSM ==========
         self.corner_forward_need_extra = rospy.get_param("~corner_forward_need_extra", 0.05)
-        self.corner_side_need_extra    = rospy.get_param("~corner_side_need_extra",    0.15)
+        self.corner_side_need_extra    = rospy.get_param("~corner_side_need_extra",    0.15) #0.15
         self.corner_trigger_x          = rospy.get_param("~corner_trigger_x", 1.20) # 0.9
         self.corner_arm_samples        = rospy.get_param("~corner_arm_samples", 1) #3
-        self.corner_step_vy            = rospy.get_param("~corner_step_vy", 0.42)  # 0.22
+        self.corner_step_vy            = rospy.get_param("~corner_step_vy", 0.82)  # 0.22
         self.corner_turn_angle_deg     = rospy.get_param("~corner_turn_angle_deg", 90.0)
         self.corner_w_max              = rospy.get_param("~corner_w_max", 1.0)
         self.corner_w_accel            = rospy.get_param("~corner_w_accel", 1.2)
         self.corner_step_timeout       = rospy.get_param("~corner_step_timeout", 3.0)
         self.corner_turn_timeout       = rospy.get_param("~corner_turn_timeout", 15.0)
-        self.corner_cooldown           = rospy.get_param("~corner_cooldown", 2.5)
+        self.corner_cooldown           = rospy.get_param("~corner_cooldown", 1.0)
         self.corner_yaw_kp             = rospy.get_param("~corner_yaw_kp", 2.0)  # (保留但 turn_mode=time 时不用)
         self.corner_yaw_dead_deg       = rospy.get_param("~corner_yaw_dead_deg", 3.0)
 
@@ -109,7 +109,7 @@ class WallFollower:
         self.turn_time_gain   = rospy.get_param("~turn_time_gain", 15.00)#1
         self.turn_time_margin = rospy.get_param("~turn_time_margin", 1.15)#0.15
         self.turn_time_min    = rospy.get_param("~turn_time_min", 0.5)
-        self.turn_time_max    = rospy.get_param("~turn_time_max", 18.0)#3
+        self.turn_time_max    = rospy.get_param("~turn_time_max", 17.0)#3
         self.wall_snap_eps_deg= rospy.get_param("~wall_snap_eps_deg", 6.0)
         self.wall_snap_hold   = rospy.get_param("~wall_snap_hold", 0.30)
         self._turn_T = None; self._turn_t0 = None; self._snap_t0 = None
