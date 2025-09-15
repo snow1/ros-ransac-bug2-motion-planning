@@ -22,12 +22,16 @@
   </node>
 
   <!-- 控制（ALIGN→LOCKED_GO→HOLD） -->
-  <node pkg="ransacbug2" type="bug2_lock_v4.py" name="bug2_lock_v3" output="screen">
+  <node pkg="ransacbug2" type="bug2_lock_v3.py" name="bug2_lock_v3" output="screen">
     <param name="side" value="right"/>
     <param name="state" value="ALIGN"/>
     <param name="scan_topic" value="/scan"/>
     <param name="cmd_vel_topic" value="/cmd_vel"/>
     <param name="perception_topic" value="/perception_lock_v2"/>
   </node>
+   <!-- RViz (loads your saved layout) -->
+  <node pkg="rviz" type="rviz" name="rviz"
+        args='-d /home/chunxue/catkin_ws/src/ros-ransac-bug2-motion-planning/rviz/config2.rviz'
+        output="screen"/>
 
 </launch>

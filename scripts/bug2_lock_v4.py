@@ -55,7 +55,7 @@ class WallFollower:
         # Align/lock gains and targets
         self.target_dist  = rospy.get_param("~target_dist", 0.60)
         self.align_tol_d  = rospy.get_param("~align_tol_d", 0.05) #0.03
-        self.align_tol_y  = rospy.get_param("~align_tol_y", 0.2)   #  0.12 ~6.9°
+        #self.align_tol_y  = rospy.get_param("~align_tol_y", 0.12)   #  0.12 ~6.9°
         self.k_vy         = rospy.get_param("~k_vy", 1.2)
         self.k_w          = rospy.get_param("~k_w", 1.5)
         self.max_vy       = rospy.get_param("~max_vy", 0.25)
@@ -67,7 +67,7 @@ class WallFollower:
         self.yaw_trim     = rospy.get_param("~yaw_trim", 0.106)
 
         # ☆ 距离优先：距离没到位前禁止转向
-        self.dist_freeze_on = rospy.get_param("~dist_freeze_on", 0.06)  # 6cm
+        #self.dist_freeze_on = rospy.get_param("~dist_freeze_on", 0.06)  # 6cm
 
         # Loss slow-down policy
         self.loss_window  = rospy.get_param("~loss_window", 20)
@@ -85,18 +85,18 @@ class WallFollower:
         # ========== ROBOT GEOMETRY & TURN NEED ==========
         self.robot_L = rospy.get_param("~robot_length", 1.00)
         self.robot_W = rospy.get_param("~robot_width",  0.66)
-        self.turn_padding = rospy.get_param("~turn_padding", 0.52)#0.22
+        self.turn_padding = rospy.get_param("~turn_padding", 0.32)#0.22
         self.R_turn_need = 0.5*math.hypot(self.robot_L, self.robot_W) + self.turn_padding
 
         # ========== CORNER FSM ==========
         self.corner_forward_need_extra = rospy.get_param("~corner_forward_need_extra", 0.05)
         self.corner_side_need_extra    = rospy.get_param("~corner_side_need_extra",    0.15) #0.15
-        self.corner_trigger_x          = rospy.get_param("~corner_trigger_x", 1.20) # 0.9
+        self.corner_trigger_x          = rospy.get_param("~corner_trigger_x", 0.20) # 0.9
         self.corner_arm_samples        = rospy.get_param("~corner_arm_samples", 1) #3
         self.corner_step_vy            = rospy.get_param("~corner_step_vy", 0.82)  # 0.22
         self.corner_turn_angle_deg     = rospy.get_param("~corner_turn_angle_deg", 90.0)
         self.corner_w_max              = rospy.get_param("~corner_w_max", 1.0)
-        self.corner_w_accel            = rospy.get_param("~corner_w_accel", 1.2)
+        self.corner_w_accel            = rospy.get_param("~corner_w_accel", 1.2)  # maybe want to try to add this value? 1.2 to 2.2
         self.corner_step_timeout       = rospy.get_param("~corner_step_timeout", 3.0)
         self.corner_turn_timeout       = rospy.get_param("~corner_turn_timeout", 15.0)
         self.corner_cooldown           = rospy.get_param("~corner_cooldown", 1.0)
@@ -104,14 +104,14 @@ class WallFollower:
         self.corner_yaw_dead_deg       = rospy.get_param("~corner_yaw_dead_deg", 3.0)
 
         # ========== TURN BY TIME / WALL-SNAP ==========
-        self.turn_mode        = rospy.get_param("~turn_mode", "time")  # "time" | "wall" | "yaw"
+        self.turn_mode        = rospy.get_param("~turn_mode", "wall")  # "time" | "wall" | "yaw"
         self.turn_w_set       = rospy.get_param("~turn_w_set", 0.80)   # 期望角速度0.6
         self.turn_time_gain   = rospy.get_param("~turn_time_gain", 15.00)#1
         self.turn_time_margin = rospy.get_param("~turn_time_margin", 1.15)#0.15
-        self.turn_time_min    = rospy.get_param("~turn_time_min", 0.5)
-        self.turn_time_max    = rospy.get_param("~turn_time_max", 17.0)#3
-        self.wall_snap_eps_deg= rospy.get_param("~wall_snap_eps_deg", 6.0)
-        self.wall_snap_hold   = rospy.get_param("~wall_snap_hold", 0.30)
+        self.turn_time_min    = rospy.get_param("~turn_time_min", 0.5)  # must add it so it must turn, from 0.5 to 5.
+        self.turn_time_max    = rospy.get_param("~turn_time_max", 18.0)#3
+        self.wall_snap_eps_deg= rospy.get_param("~wall_snap_eps_deg", 6.0) # give it more restrict goal, 6 to 4 degree
+        self.wall_snap_hold   = rospy.get_param("~wall_snap_hold", 0.30) # from 0.3s to 0.6s
         self._turn_T = None; self._turn_t0 = None; self._snap_t0 = None
 
         # ========== OPEN-LOOP YAW EST ==========
@@ -161,12 +161,16 @@ class WallFollower:
         self.right_min = float('inf')
         rospy.Subscriber("/right_min",    Float32, lambda m: setattr(self,"right_min", float(m.data)), queue_size=1)
 
-        # RUNTIME
+        # RUNTIME mem_dist: last known good distance
         self.state = "ALIGN"
         self.has_wall = 0; self.obs_front = 0; self.quality = "nan"
-        self.wall_dist = float('nan'); self.wall_yaw = float('nan')
-        self.front_min = float('inf'); self.left_min = float('inf')
-        self.mem_dist  = float('nan'); self.mem_yaw  = float('nan'); self.mem_time = None
+        self.wall_dist = float('nan'); 
+        self.wall_yaw = float('nan')
+        self.front_min = float('inf'); 
+        self.left_min = float('inf')
+        self.mem_dist  = float('nan'); 
+        self.mem_yaw  = float('nan'); 
+        self.mem_time = None
 
         # Corner runtime
         self.corner_has = False; self.corner_pt = None; self.corner_dist = float('nan')
@@ -181,11 +185,19 @@ class WallFollower:
         self.loss_hist = [0]*self.loss_window
         self.loss_ptr  = 0
 
+        # ---------- ALIGN tuning ----------
+        self.align_w_max         = rospy.get_param("~align_w_max", 0.6)   # ALIGN阶段的角速度上限（比全局max_w略小）
+        self.dist_freeze_on      = rospy.get_param("~dist_freeze_on", 0.10)  # 之前已有，留着
+        self.dist_freeze_scale   = rospy.get_param("~dist_freeze_scale", 0.30) # 距离大时对 e_yaw 的衰减系数(0~1)
+        self.align_tol_y         = rospy.get_param("~align_tol_y", 0.12)  # 对齐判定的角度容差（≈6.9°）
+
+
     # ---------- callbacks ----------
     def cb_wall_dist(self, msg):
         self.wall_dist = float(msg.data)
         if self.has_wall and self.wall_dist == self.wall_dist:
-            self.mem_dist = self.wall_dist; self.mem_time = rospy.Time.now().to_sec()
+            self.mem_dist = self.wall_dist; 
+            self.mem_time = rospy.Time.now().to_sec()
     def cb_wall_yaw(self, msg):
         self.wall_yaw = float(msg.data)  # 这里用的是“墙切向角与车头的夹角”（≈0 表示平行）
         if self.has_wall and self.wall_yaw == self.wall_yaw:
@@ -278,7 +290,7 @@ class WallFollower:
     def corner_fsm(self):
         """trigger by corner_x (+radius fallback) -> STEP_OUT -> TURN(by time/optional snap) -> COOL"""
         now = rospy.Time.now().to_sec()
-        dt  = max(1e-3, now - self._last_time)
+        dt  = max(0.02, now - self._last_time)   # dt 下限防抖
         self._last_time = now
 
         R_turn_need = self.R_turn_need
@@ -296,10 +308,7 @@ class WallFollower:
         opp_min = self.left_min if self.side == "right" else self.right_min
         if not np.isfinite(opp_min): opp_min = float('inf')
 
-        # radius fallback
-        #fresh = self.corner_has and (self._corner_arm_cnt >= self.corner_arm_samples) \
-        #and (self.corner_pt is not None) and (self.corner_pt[0] > 0.0)
-        #r_ok  = fresh and (self.corner_dist < (R_turn_need + 0.10))
+        # 半径兜底
         r_ok = self.corner_has and (self.corner_dist == self.corner_dist) and (self.corner_dist < (R_turn_need + 0.15))
         x_ok = (cx < self.corner_trigger_x)
 
@@ -329,15 +338,24 @@ class WallFollower:
                 self._wz_prev     = 0.0
                 self._soft_gate   = 1.0
 
-                # 预计算本次定时转弯所需时间
-                ang = math.radians(self.corner_turn_angle_deg)  # 90° -> 1.5708
+                # 进入 C_TURN 时记录“入口墙”与“目标墙”（新墙 = 入口墙 + 90°）
+                sign = -1.0 if self.side == "right" else +1.0
+                self.wall_yaw_enter = self.wall_yaw if (self.has_wall and self.wall_yaw == self.wall_yaw) else None
+                # 在本次转弯中单独使用的目标角（避免覆盖你全局的 yaw_trim）
+                if self.wall_yaw_enter is not None:
+                    self.yaw_trim_turn = self.wall_yaw_enter + sign*math.pi/2
+                else:
+                    self.yaw_trim_turn = getattr(self, "yaw_trim", 0.0)
+
+                # 预计算定时兜底
+                ang   = math.radians(self.corner_turn_angle_deg)  # 90° -> 1.5708
                 T_nom = self.turn_time_gain * ang / max(1e-3, self.turn_w_set) + self.turn_time_margin
                 self._turn_T  = min(self.turn_time_max, max(self.turn_time_min, T_nom))
                 self._turn_t0 = now
                 self._snap_t0 = None
 
                 self.stop("C_STEP_OUT→C_TURN (front=%.2f side=%.2f needF=%.2f needS=%.2f T=%.2fs)" %
-                          (cx, opp_min, need_front, need_side, self._turn_T))
+                        (cx, opp_min, need_front, need_side, self._turn_T))
                 return True
 
             vy = self.corner_step_vy * ( +1.0 if self.side == "right" else -1.0 ) * self.cmd_vy_sign
@@ -348,47 +366,74 @@ class WallFollower:
         if s == "C_TURN":
             sign = -1.0 if self.side == "right" else +1.0
 
-            # 角速度设定 + 加速度限幅
-            w_des = sign * self.turn_w_set
+            # -------- 误差闭环 + 限幅（末端自动减速） --------
+            use_err = (self.turn_mode == "wall") and self.has_wall and (self.wall_yaw == self.wall_yaw)
+            if use_err:
+                # wrap(err) = atan2(sin, cos)，避免跨 ±pi 抖动
+                err = math.atan2(math.sin(self.yaw_trim_turn - self.wall_yaw),
+                                math.cos(self.yaw_trim_turn - self.wall_yaw))
+                k_w  = getattr(self, "k_w_turn", 1.5)  # 建议 1.0~2.5
+                w_des = max(-self.turn_w_set, min(self.turn_w_set, k_w * err))
+            else:
+                w_des = sign * self.turn_w_set
+
             dv = self.corner_w_accel * dt
             w_cmd = w_des
             if w_cmd > self._wz_prev + dv: w_cmd = self._wz_prev + dv
             if w_cmd < self._wz_prev - dv: w_cmd = self._wz_prev - dv
             self._wz_prev = w_cmd
 
-            elapsed = now - (self._turn_t0 if self._turn_t0 is not None else now)
+            elapsed   = now - (self._turn_t0 if self._turn_t0 is not None else now)
             done_time = (self._turn_T is not None) and (elapsed >= self._turn_T)
 
-            # 可选：墙角收尾（wall-snap）
+            # -------- 增强版 wall-snap --------
             done_snap = False
+            allow_snap = (elapsed >= getattr(self, "turn_time_min", 0.6))   # 最小时间门槛
+            is_new_wall = True
             if self.turn_mode in ("wall", "time"):
                 if self.has_wall and (self.wall_yaw == self.wall_yaw):
-                    if abs(self.wall_yaw - self.yaw_trim) <= math.radians(self.wall_snap_eps_deg):
-                        if self._snap_t0 is None: self._snap_t0 = now
-                        if (now - self._snap_t0) >= self.wall_snap_hold:
-                            done_snap = True
-                    else:
-                        self._snap_t0 = None
+                    if self.wall_yaw_enter is not None:
+                        # 只认与入口墙相差 90°±window 的“新墙”
+                        window_deg = getattr(self, "snap_accept_window_deg", 30.0)
+                        delta_new = math.atan2(
+                            math.sin(self.wall_yaw - (self.wall_yaw_enter + sign*math.pi/2)),
+                            math.cos(self.wall_yaw - (self.wall_yaw_enter + sign*math.pi/2))
+                        )
+                        is_new_wall = (abs(delta_new) <= math.radians(window_deg))
+
+                    if allow_snap and is_new_wall:
+                        # snap 到本次目标角（使用 yaw_trim_turn）
+                        err_snap = math.atan2(math.sin(self.wall_yaw - self.yaw_trim_turn),
+                                            math.cos(self.wall_yaw - self.yaw_trim_turn))
+                        if abs(err_snap) <= math.radians(self.wall_snap_eps_deg):
+                            if self._snap_t0 is None: self._snap_t0 = now
+                            if (now - self._snap_t0) >= self.wall_snap_hold:
+                                done_snap = True
+                        else:
+                            self._snap_t0 = None
+                else:
+                    self._snap_t0 = None
 
             finish = False
             if self.turn_mode == "time":
-                finish = done_time            # 只看时间，不用 snap
+                finish = done_time                 # 只看时间
             elif self.turn_mode == "wall":
-                finish = done_snap or done_time
-            else:  # "yaw"
+                finish = done_snap or done_time    # snap 优先，时间兜底
+            else:  # "yaw" 分支仍用时间兜底（如你原逻辑）
                 finish = done_time
 
             if finish:
                 self.corner_state = "C_COOL"
                 self._c_t_enter   = now
                 self._wz_prev     = 0.0
-                self.stop("C_TURN→C_COOL (t=%.2fs/T=%.2fs snap=%s)" % (elapsed, self._turn_T or -1, done_snap))
+                self.stop("C_TURN→C_COOL (t=%.2fs/T=%.2fs snap=%s allow=%s new=%s)" %
+                        (elapsed, self._turn_T or -1, done_snap, allow_snap, is_new_wall))
                 return True
 
             self._publish(0.0, 0.0, w_cmd, "C_TURN t=%.2f/%.2f wz=%.2f" % (elapsed, self._turn_T or -1, w_cmd))
             return True
 
-        # 4) COOL（保持慢行或停住均可，这里保持停住以稳妥）
+        # 4) COOL
         if s == "C_COOL":
             if (now - self._c_t_enter) >= self.corner_cooldown:
                 self.corner_state = "C_IDLE"
@@ -418,23 +463,34 @@ class WallFollower:
                     e_d      = (self.target_dist - self.wall_dist)
                     yaw_meas = self.wall_yaw - self.yaw_trim
 
-                    # ☆ 距离优先：距离未到位 -> 禁止转向
-                    if abs(e_d) > self.dist_freeze_on:
-                        e_yaw = 0.0
-                    else:
-                        e_yaw = 0.0 if abs(yaw_meas) <= self.deadzone_y else -yaw_meas
+                    # 距离误差（带死区）
+                    e_d_eff = 0.0 if abs(e_d) <= self.deadzone_d else e_d
+                    vy = clamp(self.k_vy * e_d_eff, -self.max_vy, self.max_vy) * (+1.0 if self.side=="right" else -1.0)
 
-                    e_d_eff  = 0.0 if abs(e_d) <= self.deadzone_d else e_d
-                    vy = clamp(self.k_vy * e_d_eff, -self.max_vy, self.max_vy) * ( +1.0 if self.side=="right" else -1.0 )
-                    wz = clamp(self.k_w  * e_yaw,   -self.max_w,  self.max_w)
+                    # 角度误差（带死区）
+                    yaw_err = 0.0 if abs(yaw_meas) <= self.deadzone_y else -yaw_meas
+
+                    # —— 软冻结：距离误差很大时，不是把转向“清零”，而是“打折”
+                    if abs(e_d) > self.dist_freeze_on:
+                        yaw_err *= self.dist_freeze_scale  # 例如 30% 的角度纠偏仍然保留
+
+                    # ALIGN 阶段单独限幅，让转向更稳
+                    wz = clamp(self.k_w * yaw_err, -self.align_w_max, self.align_w_max)
+
+                    # 缓慢前爬，保证扫描更新与可见性
                     vx = +0.05
 
-                    if (abs(e_d) <= self.align_tol_d) and (abs(-yaw_meas) <= self.align_tol_y):
-                        self.state = "LOCKED_GO"; reason = "ALIGN->LOCKED_GO"
+                    # —— 对齐判定（带容差）：距离 + 角度 都进窗才切到 LOCKED_GO
+                    if (abs(e_d) <= self.align_tol_d) and (abs(yaw_meas) <= self.align_tol_y):
+                        self.state = "LOCKED_GO"
+                        reason = "ALIGN->LOCKED_GO"
                     else:
                         reason = "ALIGNING"
+
                 else:
-                    vx = +0.02; reason = "ALIGN_WAIT_WALL"
+                    vx, vy, wz = +0.02, 0.0, 0.0
+                    reason = "ALIGN_WAIT_WALL"
+
 
             elif self.state == "LOCKED_GO":
                 if self.has_wall and (self.wall_dist==self.wall_dist) and (self.wall_yaw==self.wall_yaw):
