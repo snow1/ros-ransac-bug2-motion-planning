@@ -22,7 +22,7 @@
   </node>
 
   <!-- 控制（ALIGN→LOCKED_GO→HOLD） -->
-  <node pkg="ransacbug2" type="bug2_lock_v3.py" name="bug2_lock_v3" output="screen">
+  <node pkg="ransacbug2" type="bug2_lock_v2.py" name="bug2_lock_v3" output="screen">
     <param name="side" value="right"/>
     <param name="state" value="ALIGN"/>
     <param name="scan_topic" value="/scan"/>

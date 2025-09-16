@@ -1,682 +1,671 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import numpy as np
-import rospy, csv, time
-from geometry_msgs.msg import Twist, Point32, PointStamped
-from std_msgs.msg import Header, Bool,Float32
-from math import isnan, hypot, pi
-class LockerV2:
+"""
+bug2_lock_v4_openloop.py
+- TURN: time + optional wall-angle snap；snap目标=本次“平行零点”（_yaw_trim_epi或yaw_trim）
+- ALIGN: 距离优先的“软冻结” yaw；首次ALIGN冻结wz取中位零点；后续ALIGN短窗自零点
+- STEP_OUT: 单阶段（vx+vy 同时），先保侧向余量，再小幅前爬把cx压到目标并hold
+- Post-TURN: 强制进入ALIGN，用更严角度容差；LOCKED_GO发现不平行立即降级ALIGN
+"""
+
+import os, csv, time, math, numpy as np
+import rospy
+from std_msgs.msg import Float32, Bool
+from geometry_msgs.msg import Twist, PointStamped
+
+# ---------- helpers ----------
+def clamp(x, lo, hi): return max(lo, min(hi, x))
+def ang_norm(a): return (a + math.pi) % (2*math.pi) - math.pi
+
+# ---------- lightweight visited grid (optional) ----------
+class VisitedGrid:
+    def __init__(self, res=0.25, mark_step=0.25, ahead_cells=8, decay=0.0):
+        self.res, self.mark_step, self.ahead_cells, self.decay = float(res), float(mark_step), int(ahead_cells), float(decay)
+        self.grid, self.last_mark_pose = {}, None
+    def _key(self, x, y):
+        r = self.res
+        return (int(round(x/r)), int(round(y/r)))
+    def mark(self, x, y):
+        if any(map(lambda v: v!=v, (x,y))):  # NaN check
+            return False
+        if self.last_mark_pose is None or math.hypot(x-self.last_mark_pose[0], y-self.last_mark_pose[1]) >= self.mark_step:
+            self.last_mark_pose = (x, y)
+            k = self._key(x,y)
+            self.grid[k] = self.grid.get(k, 0) + 1
+            if self.decay > 0:
+                for kk in list(self.grid.keys()):
+                    self.grid[kk] *= (1.0 - self.decay)
+                    if self.grid[kk] < 0.25: self.grid.pop(kk, None)
+            return True
+        return False
+    def score_ahead(self, x, y, yaw):
+        if any(map(lambda v: v!=v, (x,y,yaw))): return float('nan')
+        s, c, sY = 0.0, math.cos(yaw), math.sin(yaw)
+        for i in range(1, self.ahead_cells+1):
+            px, py = x + i*self.res*c, y + i*self.res*sY
+            s += self.grid.get(self._key(px,py), 0)
+        return s
+
+# ---------- main controller ----------
+class WallFollower:
     def __init__(self):
-        # === 行为参数 ===
-        # If your base moves the opposite way on Y, set this to -1.0 in the launch.
-        self.cmd_vy_sign = rospy.get_param("~cmd_vy_sign", -1.0)  # try -1.0 given your symptom
+        # ========== BASIC ==========
+        self.side = rospy.get_param("~side", "right")
+        self.cmd_vx_sign = rospy.get_param("~cmd_vx_sign", 1.0)
+        self.cmd_vy_sign = rospy.get_param("~cmd_vy_sign", 1.0)
 
-        self.target_dist = rospy.get_param("~target_dist", 0.60)
-        self.align_tol_d = rospy.get_param("~align_tol_d", 0.03)
-        self.align_tol_y = rospy.get_param("~align_tol_y", 0.03)
+        # Align/lock gains and targets
+        self.target_dist  = rospy.get_param("~target_dist", 0.60)
+        self.align_tol_d  = rospy.get_param("~align_tol_d", 0.05)
+        self.k_vy         = rospy.get_param("~k_vy", 1.2)
+        self.k_w          = rospy.get_param("~k_w", 1.5)
+        self.max_vy       = rospy.get_param("~max_vy", 0.25)
+        self.max_w        = rospy.get_param("~max_w",  0.65)
+        self.forward_speed      = rospy.get_param("~forward_speed", 0.05)#0.18
+        self.forward_speed_hold = rospy.get_param("~forward_speed_hold", 0.05)
+        self.deadzone_d   = rospy.get_param("~deadzone_d", 0.02)
+        self.deadzone_y   = rospy.get_param("~deadzone_y", 0.12)
+        self.yaw_trim     = rospy.get_param("~yaw_trim", 0.106)  # 全局零点；首次/后续ALIGN会给会话零点
 
-        self.forward_speed = rospy.get_param("~forward_speed", 0.12)
-        self.forward_speed_hold = rospy.get_param("~forward_speed_hold", 0.08)
-        self.min_forward_speed = rospy.get_param("~min_forward_speed", 0.06)
-
-        # 对齐阶段增益
-        self.k_vy = rospy.get_param("~k_vy", 1.2)
-        self.k_w  = rospy.get_param("~k_w", 1.5)
-        self.max_vy = rospy.get_param("~max_vy", 0.25)
-        self.max_w  = rospy.get_param("~max_w", 0.5)
-
-        # LOCKED_GO 阶段的小幅纠偏（麦轮）
-        self.k_vy_go = rospy.get_param("~k_vy_go", 0.8)
-        self.k_w_go  = rospy.get_param("~k_w_go", 0.8)
-        self.max_vy_go = rospy.get_param("~max_vy_go", 0.20)
-        self.max_w_go  = rospy.get_param("~max_w_go", 0.35)
-        self.deadzone_d   = rospy.get_param("~deadzone_d", 0.01)
-        self.deadzone_yaw = rospy.get_param("~deadzone_yaw", 0.01)
-
-        # 安全/丢失
-        self.front_stop = rospy.get_param("~front_stop", 0.40)
-        self.loss_timeout_stop = rospy.get_param("~loss_timeout_stop", 2.5)
-        self.loss_grace = rospy.get_param("~loss_grace", 0.8)
-        self.reacq_tol_d = rospy.get_param("~reacq_tol_d", 0.08)
-        self.reacq_tol_y = rospy.get_param("~reacq_tol_y", 0.10)
-        self.loss_slowdown_window = rospy.get_param("~loss_slowdown_window", 10.0)
+        # Loss slow-down policy
+        self.loss_window  = rospy.get_param("~loss_window", 20)
         self.loss_slowdown_thresh = rospy.get_param("~loss_slowdown_thresh", 3)
 
-        # 与底盘限幅
-        self.limit_vx = rospy.get_param("~limit_vx", 0.20)
-        self.limit_vy = rospy.get_param("~limit_vy", 0.20)
-        self.limit_w  = rospy.get_param("~limit_w", 0.60)
+        # Output limits + soft start
+        self.limit_vx   = rospy.get_param("~limit_vx", 0.22)
+        self.limit_vy   = rospy.get_param("~limit_vy", 0.22)
+        self.limit_w    = rospy.get_param("~limit_w",  1.00)
+        self.soft_enable= rospy.get_param("~soft_enable", True)
+        self.soft_up    = rospy.get_param("~soft_up",   0.04)
+        self.soft_down  = rospy.get_param("~soft_down", 0.06)
+        self._soft_gate = 0.0
 
-        # 软启动/收
-        self.soft_gate = 0.0
-        self.soft_up   = rospy.get_param("~soft_up",   0.04)
-        self.soft_down = rospy.get_param("~soft_down", 0.06)
-        self.soft_enable = rospy.get_param("~soft_enable", True)
+        # ========== ROBOT GEOMETRY & TURN NEED ==========
+        self.robot_L = rospy.get_param("~robot_length", 1.00)
+        self.robot_W = rospy.get_param("~robot_width",  0.66)
+        self.turn_padding = rospy.get_param("~turn_padding", 0.25)
+        self.R_turn_need = 0.5*math.hypot(self.robot_L, self.robot_W) + self.turn_padding
 
-                # __init__ 里加：
-        self.turn_back_enable   = rospy.get_param("~turn_back_enable", True)  # 开关
-        self.turn_back_vx       = rospy.get_param("~turn_back_vx", -0.05)     # 轻微后退 m/s
-        self.turn_back_duration = rospy.get_param("~turn_back_duration", 0.8) # 仅前0.8s
-        self.turn_side_push_vy  = rospy.get_param("~turn_side_push_vy", 0.0)  # 默认不侧摆；如需更安全可给 +0.04(右墙向左)
+        # ========== CORNER FSM ==========
+        self.corner_forward_need_extra = rospy.get_param("~corner_forward_need_extra", 0.01)
+        self.corner_side_need_extra    = rospy.get_param("~corner_side_need_extra",    0.15)
+        self.corner_trigger_x          = rospy.get_param("~corner_trigger_x", 0.01)
+        self.corner_arm_samples        = rospy.get_param("~corner_arm_samples", 1)
+        self.corner_step_vy            = rospy.get_param("~corner_step_vy", 0.82)
+        self.corner_turn_angle_deg     = rospy.get_param("~corner_turn_angle_deg", 90.0)
+        self.corner_w_max              = rospy.get_param("~corner_w_max", 1.0)
+        self.corner_w_accel            = rospy.get_param("~corner_w_accel", 1.2)
+        self.corner_step_timeout       = rospy.get_param("~corner_step_timeout", 3.0)
+        self.corner_turn_timeout       = rospy.get_param("~corner_turn_timeout", 15.0)
+        self.corner_cooldown           = rospy.get_param("~corner_cooldown", 1.0)
+        self.corner_yaw_kp             = rospy.get_param("~corner_yaw_kp", 2.0)
+        self.corner_yaw_dead_deg       = rospy.get_param("~corner_yaw_dead_deg", 3.0)
 
+        # ========== TURN BY TIME / WALL-SNAP ==========
+        self.turn_mode        = rospy.get_param("~turn_mode", "time")  # "time" | "wall" | "yaw"
+        self.turn_w_set       = rospy.get_param("~turn_w_set", 0.80)
+        self.turn_time_gain   = rospy.get_param("~turn_time_gain", 15.00)
+        self.turn_time_margin = rospy.get_param("~turn_time_margin", 1.15)
+        self.turn_time_min    = rospy.get_param("~turn_time_min", 0.5)
+        self.turn_time_max    = rospy.get_param("~turn_time_max", 17.5)
+        self.wall_snap_eps_deg= rospy.get_param("~wall_snap_eps_deg", 90.0) #6.0
+        self.wall_snap_hold   = rospy.get_param("~wall_snap_hold", 0.30)
+        self._turn_T = None; self._turn_t0 = None; self._snap_t0 = None
 
-                # ===== 在 __init__ 里新增这些参数（保持原有参数不删） =====
-        self.simple_corner_turn_dist = rospy.get_param("~simple_corner_turn_dist", 1.20)  # 触发距离
-        self.simple_clear_extra      = rospy.get_param("~simple_clear_extra",     0.15)  # 额外侧向净空
-        self.simple_side_speed       = rospy.get_param("~simple_side_speed",      0.18)  # 让位侧移速度上限
-        self.simple_side_timeout     = rospy.get_param("~simple_side_timeout",    1.2)   # 让位最长时长(s)
-        self.simple_turn_speed       = rospy.get_param("~simple_turn_speed",      0.6)   # 原地转角速度(rad/s)
-        self.simple_yaw_tol_deg      = rospy.get_param("~simple_yaw_tol_deg",     5.0)   # 角度容差
-        self.simple_yaw_hold_frames  = rospy.get_param("~simple_yaw_hold_frames", 3)     # 连续满足帧数
-        self.simple_turn_timeout     = rospy.get_param("~simple_turn_timeout",    5.0)   # 转弯兜底时长(s)
-        self.simple_forward_only     = rospy.get_param("~simple_forward_only",    True)  # 只接受前方角点
+        # ========== OPEN-LOOP YAW EST ==========
+        self.yaw_openloop_gain = rospy.get_param("~yaw_openloop_gain", 1.0)
+        self.yaw_est = 0.0
+        self.yaw_est_stamp = rospy.Time.now().to_sec()
+        self.pub_turn_deg  = rospy.Publisher("/turn_angle_deg", Float32, queue_size=1)
+        self.pub_turn_done = rospy.Publisher("/turn_done",     Bool,    queue_size=1)
+        self.turn_dead_deg = rospy.get_param("~turn_dead_deg", 3.0)
+        self.turn_stable_N = rospy.get_param("~turn_stable_N", 3)
+        self._turn_stable_cnt = 0
 
-        # 角点触发（新增）
-        self.side = rospy.get_param("~side", "right")  # right/left，用于决定转向
-        self.corner_trigger_dist = rospy.get_param("~corner_trigger_dist", 1.20)   # 触发
-        self.corner_reset_dist   = rospy.get_param("~corner_reset_dist",   1.30)   # 滞回
-        self.corner_turn_speed   = rospy.get_param("~corner_turn_speed",   0.6)    # rad/s
-        self.corner_turn_angle   = rospy.get_param("~corner_turn_angle",   pi/2)   # 90°
-        self.corner_cooldown     = rospy.get_param("~corner_cooldown",     4.0)    # s
-        self.corner_fresh_t      = rospy.get_param("~corner_fresh_t",      0.8)    # 角点消息新鲜度 s
-        self.corner_forward_only = rospy.get_param("~corner_forward_only", True)   # 仅前方角点触发
+        # ========== VISITED GRID (optional) ==========
+        self.visited_enable   = rospy.get_param("~visited_enable", True)
+        self.vis_res          = rospy.get_param("~visited_res", 0.25)
+        self.vis_mark_step    = rospy.get_param("~visited_mark_step", 0.25)
+        self.vis_ahead_cells  = rospy.get_param("~visited_ahead_cells", 8)
+        self.vis_decay        = rospy.get_param("~visited_decay", 0.0)
+        self.vis = VisitedGrid(self.vis_res, self.vis_mark_step, self.vis_ahead_cells, self.vis_decay)
 
-        self.corner_prepare_t = rospy.get_param("~corner_prepare_t", 0.30)  # 预停时长(s)
-        self.corner_brake_times = rospy.get_param("~corner_brake_times", 3) # 进入转弯前，多发几帧0速度
-        self.corner_state = "IDLE"  # IDLE / APPROACH_STOP / TURNING / COOLDOWN
-        self.corner_prepare_end = 0.0
-
-        # --- 角点触发的“真·边沿/武装”参数（用于防止静止反复触发） ---
-        self.corner_arm_samples = rospy.get_param("~corner_arm_samples", 3)     # 连续 N 帧 > reset 才武装
-        self.corner_trend_eps   = rospy.get_param("~corner_trend_eps", 0.015)   # 下降趋势阈值(米/帧)
-        self.corner_min_vx_to_trigger = rospy.get_param("~corner_min_vx_to_trigger", 0.05)  # 仅在前进触发
-
-                # === 参数：安全侧距（可在 launch 里覆盖），以及外摆速度与超时 ===
-        # 建议默认 0.85 m；如果雷达不在车体中心，需要 +/− 安装偏置
-        self.safe_clearance = rospy.get_param("~safe_clearance", 0.85)  # m
-        self.clear_speed    = rospy.get_param("~clear_speed",    0.18)  # m/s，侧向外摆速度上限
-        self.clear_timeout  = rospy.get_param("~clear_timeout",  2.0)   # s，外摆最长时长
-
-        # >>> PATCH: 允许在 HOLD 也能触发角点（默认加入 HOLD，仍可通过参数覆盖）
-        _default_trig_states = ["LOCKED_GO","HOLD"]
-        self.corner_trigger_in_states = rospy.get_param("~corner_trigger_in_states", _default_trig_states)
-        # <<< PATCH
-
-        # --- 运行时辅助状态（供 corner_fsm 使用） ---
-        self.corner_armed = False
-        self.corner_arm_cnt = 0
-        self.corner_prev_dist = None
-        self.current_vx = 0.0  # 在 publish() 内更新
-
-        # --- 角度闭环参数 ---
-        self.turn_yaw_tol_deg   = rospy.get_param("~turn_yaw_tol_deg", 6.0)   # 墙朝向容差 ±6°
-        self.turn_hold_frames   = rospy.get_param("~turn_hold_frames", 3)     # 连续K帧满足才算到位
-        self.turn_exit_extra_m  = rospy.get_param("~turn_exit_extra_m", 0.30) # 角点距离退出冗余
-        self.turn_max_time      = rospy.get_param("~turn_max_time",  5.0)     # 兜底最长转弯时间
-
-        # 进入TURNING时记录
-        self.turn_yaw_start = None
-        self.turn_yaw_target = None
-        self.turn_hold_cnt = 0
-        # 用于取墙朝向的“稳态值”
-        self._yaw_buf = []
-        self._yaw_buf_len = rospy.get_param("~turn_yaw_buf_len", 5)
-
-        # 话题与日志
-        self.cmd_topic = rospy.get_param("~cmd_topic", "/cmd_vel")
-        self.log_path = rospy.get_param("~log_path", "/tmp/wf_lock_v2_{:d}.csv".format(int(time.time())))
-
-        # === 状态 ===
-        self.state = "ALIGN"    # ALIGN → LOCKED_GO → HOLD → (LOCKED_GO / FAIL_STOP)
-        self.last_perc_t = None
-        self.has_wall = 0
-        self.obs_front = 0
-        self.quality = "nan"
-        self.wall_dist = float('nan')   # 与墙的横向距离
-        self.wall_yaw  = float('nan')   # 与墙夹角(rad)
-        self.clearance = float('nan')
-
-        # 记忆
-        self.mem_dist = float('nan')
-        self.mem_yaw  = float('nan')
-        self.mem_time = None
-
-        # 丢失统计
-        self.loss_events = []
-
-        # === 角点子状态机（新增） ===
-        self.corner_has = False
-        self.corner_pt  = None          # (x,y) in base_link（建议）
-        self.corner_dist = float('nan')
-        self.corner_last_over = True    # 上一帧是否在“重置距离之外”
-        self.corner_state = "IDLE"      # IDLE / TURNING / COOLDOWN
-        self.corner_turn_end_time = 0.0
-        self.corner_cool_end_time = 0.0
-        self.corner_last_stamp = None   # 角点消息时间戳
-
-        # ROS I/O
-        self.pub_cmd = rospy.Publisher(self.cmd_topic, Twist, queue_size=10)
-        rospy.Subscriber("/wall_lateral",     Float32,     self.cb_wall_dist,   queue_size=1)
-        rospy.Subscriber("/wall_angle",       Float32,     self.cb_wall_yaw,    queue_size=1)
-        rospy.Subscriber("/wall_has",         Bool,        self.cb_wall_has,    queue_size=1)
-        rospy.Subscriber("/obstacle_ahead",   Bool,        self.cb_obs_front,   queue_size=1)
-        rospy.Subscriber("/wall_quality",     Float32,     self.cb_wall_quality,queue_size=1)
-        rospy.Subscriber("/corner_has",   Bool,         self.cb_corner_has, queue_size=1)
-        rospy.Subscriber("/corner_point", PointStamped, self.cb_corner_pt,  queue_size=1)
-
-        # CSV
+        # ========== IO & LOG ==========
+        self.pub_cmd = rospy.Publisher(rospy.get_param("~cmd_vel", "/cmd_vel"), Twist, queue_size=1)
+        logdir = rospy.get_param("~log_dir", "/tmp")
+        os.makedirs(logdir, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        self.log_path = os.path.join(logdir, f"wf_lock_v4_{ts}.csv")
         self.csvf = open(self.log_path, "w", newline="")
         self.csv = csv.writer(self.csvf)
         self.csv.writerow([
-            "time","state","reason",
-            "has_wall","obs_front","quality",
-            "wall_dist","wall_yaw(rad)","clearance",
-            "mem_dist","mem_yaw","mem_age",
-            "corner_state","corner_has","corner_dist",
-            "vx_cmd","vy_cmd","w_cmd",
-            "vx_limited","vy_limited","w_limited",
-            "soft_gate"
+            "time","state","reason","has_wall","obs_front","quality",
+            "wall_dist","wall_yaw(rad)","front_min","left_min","mem_dist","mem_yaw","mem_age",
+            "corner_state","corner_has","corner_dist","odom_x","odom_y","odom_yaw","vis_score_ahead",
+            "vx_cmd","vy_cmd","w_cmd","vx_limited","vy_limited","w_limited","soft_gate"
         ])
-        rospy.loginfo("bug2_lock_v2 with CORNER TURN started. log -> %s", self.log_path)
-        rospy.loginfo("PARAM: trigger=%.2fm reset=%.2fm turn=%.1fdeg@%.2frad/s cooldown=%.1fs",
-                      self.corner_trigger_dist, self.corner_reset_dist,
-                      self.corner_turn_angle*180.0/pi, self.corner_turn_speed, self.corner_cooldown)
+        rospy.loginfo("bug2_lock_v4_openloop started. log -> %s", self.log_path)
 
-    # === 订阅回调 ===
-    def cb_wall_yaw(self, msg):
-        self.wall_yaw = float(msg.data)
-        self._yaw_buf.append(self.wall_yaw)
-        if len(self._yaw_buf) > self._yaw_buf_len:
-            self._yaw_buf.pop(0)
-        self.last_perc_t = rospy.Time.now().to_sec()
+        # SUBS (from perception)
+        rospy.Subscriber("/wall_lateral", Float32, self.cb_wall_dist, queue_size=1)
+        rospy.Subscriber("/wall_angle",   Float32, self.cb_wall_yaw,  queue_size=1)
+        rospy.Subscriber("/wall_has",     Bool,    self.cb_wall_has,  queue_size=1)
+        rospy.Subscriber("/obstacle_ahead", Bool,  self.cb_obs_front, queue_size=1)
+        rospy.Subscriber("/wall_quality", Float32, self.cb_wall_quality, queue_size=1)
+        rospy.Subscriber("/corner_has",   Bool,    self.cb_corner_has, queue_size=1)
+        rospy.Subscriber("/corner_point", PointStamped, self.cb_corner_pt, queue_size=1)
+        rospy.Subscriber("/front_min",    Float32, self.cb_front_min, queue_size=1)
+        rospy.Subscriber("/left_min",     Float32, self.cb_left_min,  queue_size=1)
+        self.right_min = float('inf')
+        rospy.Subscriber("/right_min",    Float32, lambda m: setattr(self,"right_min", float(m.data)), queue_size=1)
 
-    def cb_wall_dist(self, msg: Float32):
+        # RUNTIME mem_dist
+        self.state = "ALIGN"
+        self.has_wall = 0; self.obs_front = 0; self.quality = "nan"
+        self.wall_dist = float('nan')
+        self.wall_yaw  = float('nan')
+        self.front_min = float('inf')
+        self.left_min  = float('inf')
+        self.mem_dist  = float('nan')
+        self.mem_yaw   = float('nan')
+        self.mem_time  = None
+
+        # Corner runtime
+        self.corner_has = False; self.corner_pt = None; self.corner_dist = float('nan')
+        self.corner_state = "C_IDLE"
+        self._c_t_enter   = 0.0
+        self._turn_yaw0   = None
+        self._wz_prev     = 0.0
+        self._last_time   = rospy.Time.now().to_sec()
+        self._corner_arm_cnt = 0
+
+        # Loss slow-down
+        self.loss_hist = [0]*self.loss_window
+        self.loss_ptr  = 0
+
+        # ---------- ALIGN tuning ----------
+        self.align_w_max         = rospy.get_param("~align_w_max", 0.6)   # ALIGN阶段角速度上限
+        self.dist_freeze_on      = rospy.get_param("~dist_freeze_on", 0.10)
+        self.dist_freeze_scale   = rospy.get_param("~dist_freeze_scale", 0.30)
+        self.align_tol_y         = rospy.get_param("~align_tol_y", 0.12)  # ≈6.9°
+
+        # ---------- POST-TURN ALIGN POLICY ----------
+        self.post_turn_force_align      = rospy.get_param("~post_turn_force_align", True)
+        self.post_turn_align_lock_time  = rospy.get_param("~post_turn_align_lock_time", 1.0)
+        self.post_turn_align_tol_y      = rospy.get_param("~post_turn_align_tol_y", min(self.align_tol_y, 0.12))
+        self.locked_to_align_y          = rospy.get_param("~locked_to_align_y", max(0.12, self.align_tol_y))
+        self._post_turn_until           = 0.0
+
+        # ---------- Auto-zero for later ALIGNs ----------
+        self.auto_yaw_zero          = rospy.get_param("~auto_yaw_zero", True)
+        self.auto_yaw_window        = rospy.get_param("~auto_yaw_window", 0.40)  # s
+        self.auto_yaw_samples_min   = rospy.get_param("~auto_yaw_samples_min", 6)
+        self.auto_yaw_dist_gate     = rospy.get_param("~auto_yaw_dist_gate", 0.06)   # m
+        self.auto_yaw_var_gate_deg  = rospy.get_param("~auto_yaw_var_gate_deg", 2.0) # deg
+        self._az_t0        = None
+        self._az_buf       = []
+        self._yaw_trim_epi = None
+        self._prev_state   = None
+
+        # ---------- FIRST ALIGN freeze & calibration ----------
+        self.first_align_freeze       = rospy.get_param("~first_align_freeze", True)
+        self.first_align_zero_window  = rospy.get_param("~first_align_zero_window", 0.50)  # s
+        self.first_align_samples_min  = rospy.get_param("~first_align_samples_min", 6)
+        self.first_align_var_gate_deg = rospy.get_param("~first_align_var_gate_deg", 2.5)  # deg
+        self.first_align_dist_gate    = rospy.get_param("~first_align_dist_gate", 0.10)    # m
+        self.first_align_require_dist = rospy.get_param("~first_align_require_dist", False)
+        self.first_align_freeze_max   = rospy.get_param("~first_align_freeze_max", 2.0)    # s
+        self._first_align_active = False
+        self._first_align_done   = False
+        self._first_align_t0     = None
+        self._first_align_buf    = []
+
+        # ----- STEP_OUT single-phase approach-X（转前贴角）-----
+        self.corner_cx_offset   = rospy.get_param("~corner_cx_offset", 0.0)   # 雷达到车头/转向参考的x偏置
+        self.corner_cx_target   = rospy.get_param("~corner_cx_target", 0.06)  # 期望转弯时的cx
+        self.corner_cx_min      = rospy.get_param("~corner_cx_min",    0.03)  # 不小于此，留保險
+        self.corner_cx_hold     = rospy.get_param("~corner_cx_hold",   0.25)  # 到位保持时长
+        self.corner_approach_vx = rospy.get_param("~corner_approach_vx", 0.08)
+        self.corner_approach_timeout = rospy.get_param("~corner_approach_timeout", 1.5)
+        self.corner_cx_beta     = rospy.get_param("~corner_cx_beta",   0.35)
+        self.front_stop_min     = rospy.get_param("~front_stop_min",   0.12)
+
+        self._cx_filt = None
+        self._cx_hold_t0 = None
+        self._approach_t0 = None
+
+    # ---------- callbacks ----------
+    def cb_wall_dist(self, msg):
         self.wall_dist = float(msg.data)
-        self.last_perc_t = rospy.Time.now().to_sec()
+        if self.has_wall and self.wall_dist == self.wall_dist:
+            self.mem_dist = self.wall_dist
+            self.mem_time = rospy.Time.now().to_sec()
 
-    def cb_wall_has(self, msg: Bool):
-        self.has_wall = 1 if msg.data else 0
+    def cb_wall_yaw(self, msg):
+        self.wall_yaw = float(msg.data)  # 墙切向角（≈0 表示与车身平行）
+        if self.has_wall and self.wall_yaw == self.wall_yaw:
+            self.mem_yaw = self.wall_yaw
 
-    def cb_obs_front(self, msg: Bool):
-        self.obs_front = 1 if msg.data else 0
+    def cb_wall_has(self, msg): self.has_wall = int(bool(msg.data))
+    def cb_obs_front(self, msg): self.obs_front = int(bool(msg.data))
+    def cb_wall_quality(self, msg): self.quality = f"{float(msg.data):.1f}"
+    def cb_front_min(self, msg): self.front_min = float(msg.data)
+    def cb_left_min(self, msg):  self.left_min  = float(msg.data)
 
-    def cb_wall_quality(self, msg: Float32):
-        self.quality = f"{msg.data:.1f}"
+    def cb_corner_pt(self, msg: PointStamped):
+        x, y = msg.point.x, msg.point.y
+        self.corner_pt = (float(x), float(y))
+        self.corner_dist = math.hypot(x,y)
+        if self.corner_has and (x==x) and (x>0):
+            self._corner_arm_cnt = min(self.corner_arm_samples, self._corner_arm_cnt+1)
+        else:
+            self._corner_arm_cnt = 0
 
     def cb_corner_has(self, msg: Bool):
         self.corner_has = bool(msg.data)
+        if not self.corner_has:
+            self.corner_dist = float('inf')
+            self.corner_pt   = None
+            self._corner_arm_cnt = 0
 
-    def cb_corner_pt(self, msg: PointStamped):
-        x = msg.point.x; y = msg.point.y
-        self.corner_pt = (x, y)
-        self.corner_dist = hypot(x, y)
-        self.corner_last_stamp = msg.header.stamp.to_sec() if msg.header.stamp else rospy.Time.now().to_sec()
+    # ---------- helpers ----------
+    def _is_wall_following_simple(self):
+        if self.has_wall and (self.wall_dist == self.wall_dist) and (self.wall_yaw == self.wall_yaw):
+            dist_ok  = abs(self.wall_dist - self.target_dist) <= (self.align_tol_d + 0.02)
+            yaw_meas = self.wall_yaw - self.yaw_trim
+            yaw_ok   = abs(yaw_meas) <= (self.align_tol_y + 1e-6)
+            return dist_ok and yaw_ok
+        return False
 
-    # === 状态打印 ===
-    def set_state(self, new_state, reason=""):
-        if new_state != self.state:
-            rospy.loginfo("[STATE] %s -> %s | %s | d=%.3f yaw=%.1fdeg corner=%.2fm",
-                          self.state, new_state, reason,
-                          self.wall_dist if self.wall_dist==self.wall_dist else float('nan'),
-                          (self.wall_yaw*180.0/pi) if self.wall_yaw==self.wall_yaw else float('nan'),
-                          self.corner_dist if self.corner_dist==self.corner_dist else float('nan'))
-            self.state = new_state
-
-    # === 统一发布（限幅+软门+CSV） ===
-    def publish(self, vx, vy, wz, reason=""):
-        vx_l = max(min(vx, self.limit_vx), -self.limit_vx)
-        vy_l = max(min(vy, self.limit_vy), -self.limit_vy)
-        wz_l = max(min(wz, self.limit_w ), -self.limit_w )
-
-        target_mag = max(abs(vx_l), abs(vy_l), abs(wz_l))
+    def _limit_soft(self, vx, vy, wz):
+        vx = clamp(vx, -self.limit_vx, self.limit_vx)
+        vy = clamp(vy, -self.limit_vy, self.limit_vy)
+        wz = clamp(wz, -self.limit_w,  self.limit_w)
+        gate_for_w = 1.0 if self.corner_state == "C_TURN" else self._soft_gate
         if self.soft_enable:
-            if target_mag > 1e-6:
-                self.soft_gate = min(1.0, self.soft_gate + self.soft_up)
-            else:
-                self.soft_gate = max(0.0, self.soft_gate - self.soft_down)
-        else:
-            self.soft_gate = 1.0 if target_mag > 1e-6 else 0.0
+            mag = max(abs(vx), abs(vy), abs(wz))
+            if mag > 1e-3: self._soft_gate = min(1.0, self._soft_gate + self.soft_up)
+            else:          self._soft_gate = max(0.0, self._soft_gate - self.soft_down)
+            vx *= self._soft_gate
+            vy *= self._soft_gate
+            wz *= gate_for_w
+        return vx, vy, wz
 
-        vx_out = vx_l * self.soft_gate
-        vy_out = self.cmd_vy_sign * vy_l * self.soft_gate   # ← flip here
-        wz_out = wz_l * self.soft_gate
+    def _get_pose_odom(self):
+        """No IMU/odom: return NaN x,y and open-loop yaw_est"""
+        return float('nan'), float('nan'), self.yaw_est
 
-        cmd = Twist()
-        cmd.linear.x  = vx_out
-        cmd.linear.y  = vy_out
-        cmd.angular.z = wz_out
-        self.pub_cmd.publish(cmd)
-        self.current_vx = vx_out
-
+    def _publish(self, vx, vy, wz, reason=""):
+        vx_l, vy_l, wz_l = self._limit_soft(vx, vy, wz)
         now = rospy.Time.now().to_sec()
-        mem_age = (now - self.mem_time) if self.mem_time else float('nan')
-        self.csv.writerow([
-            now, self.state, reason,
-            self.has_wall, self.obs_front, self.quality,
-            self.wall_dist, self.wall_yaw, self.clearance,
-            self.mem_dist, self.mem_yaw, mem_age,
-            self.corner_state, int(self.corner_has), self.corner_dist,
-            vx, vy, wz,
-            vx_l, vy_l, wz_l,
-            self.soft_gate
-        ])
+        dt  = max(1e-3, now - self.yaw_est_stamp)
+        self.yaw_est += (self.yaw_openloop_gain * wz_l) * dt
+        self.yaw_est = ang_norm(self.yaw_est)
+        self.yaw_est_stamp = now
+
+        msg = Twist()
+        msg.linear.x  = vx_l * self.cmd_vx_sign
+        msg.linear.y  = vy_l * self.cmd_vy_sign
+        msg.angular.z = wz_l
+        self.pub_cmd.publish(msg)
+
+        ox, oy, oyaw = self._get_pose_odom()
+        vis_score = self.vis.score_ahead(ox, oy, oyaw) if self.visited_enable else float('nan')
+
+        tnow = rospy.Time.now().to_sec()
+        mem_age = (tnow - self.mem_time) if self.mem_time else float('nan')
+        self.csv.writerow([tnow, self.state, reason, int(self.has_wall), int(self.obs_front), self.quality,
+                           self.wall_dist, self.wall_yaw, self.front_min, self.left_min,
+                           self.mem_dist, self.mem_yaw, mem_age,
+                           self.corner_state, int(self.corner_has), self.corner_dist,
+                           ox, oy, self.yaw_est, vis_score,
+                           vx, vy, wz, vx_l, vy_l, wz_l, self._soft_gate])
+        try: self.csvf.flush()
+        except Exception: pass
 
     def stop(self, reason="STOP"):
-        self.publish(0.0, 0.0, 0.0, reason)
+        self._publish(0.0, 0.0, 0.0, reason)
 
-    def losses_in_window(self, now):
-        self.loss_events = [t for t in self.loss_events if now - t <= self.loss_slowdown_window]
-        return len(self.loss_events)
-    
-    def _wrap(self, a):
-        return (a + np.pi) % (2*np.pi) - np.pi
-
-    # === 角点子状态机 ===
+    # ---------- Corner FSM ----------
     def corner_fsm(self):
+        """trigger by corner_x (+radius fallback) -> STEP_OUT (single-phase) -> TURN(by time/optional snap) -> COOL"""
         now = rospy.Time.now().to_sec()
+        dt  = max(0.02, now - self._last_time)
+        self._last_time = now
 
-        if self.corner_state == "TURNING":
-            wsign = -1.0 if self.side == "right" else +1.0
-            self.publish(0.0, 0.0, wsign * self.corner_turn_speed, "CORNER_TURNING")
+        R_turn_need = self.R_turn_need
+        need_front  = R_turn_need + self.corner_forward_need_extra
+        need_side   = R_turn_need + self.corner_side_need_extra
 
-            done = False
+        # corner_x (forward component)
+        cx = float('inf')
+        if self.corner_has and (self.corner_pt is not None):
+            px, py = self.corner_pt
+            if (px==px) and (px>0) and (self._corner_arm_cnt >= self.corner_arm_samples):
+                cx = px
 
-            if (self.turn_yaw_target is not None) and (self.wall_yaw == self.wall_yaw):
-                err = abs(self._wrap(self.wall_yaw - self.turn_yaw_target))
-                if err <= (self.turn_yaw_tol_deg * np.pi/180.0):
-                    self.turn_hold_cnt += 1
-                else:
-                    self.turn_hold_cnt = 0
-                if self.turn_hold_cnt >= self.turn_hold_frames:
-                    rospy.loginfo("[CORNER] 墙朝向到位 err=%.1f° 连续%d帧",
-                                err*180.0/np.pi, self.turn_hold_frames)
-                    done = True
+        # opposite-side clearance
+        opp_min = self.left_min if self.side == "right" else self.right_min
+        if not np.isfinite(opp_min): opp_min = float('inf')
 
-            if (not done) and (self.corner_pt is not None):
-                cx, cy = self.corner_pt
-                dist_exit = (self.corner_trigger_dist + self.turn_exit_extra_m)
-                side_ok = ((self.side=="right" and (cx < 0.0) and (cy < -(self.target_dist+0.10))) or
-                        (self.side=="left"  and (cx < 0.0) and (cy >  (self.target_dist+0.10))))
-                far_ok  = (self.corner_dist > dist_exit)
-                if side_ok or far_ok:
-                    rospy.loginfo("[CORNER] 角点退出：%s%s",
-                                "身侧/身后 " if side_ok else "",
-                                "距离>%.2fm" % dist_exit if far_ok else "")
-                    done = True
+        # 半径兜底（可作为额外触发条件）
+        r_ok = self.corner_has and (self.corner_dist == self.corner_dist) and (self.corner_dist < (R_turn_need + 0.15))
+        x_ok = (cx < self.corner_trigger_x)
 
-            if (not done) and (now >= self.corner_turn_end_time or (now - (self.corner_turn_end_time - 9999)) > self.turn_max_time):
-                rospy.logwarn("[CORNER] 兜底超时，强制结束转弯")
-                done = True
+        s = self.corner_state
 
-            if done:
-                self.corner_state = "COOLDOWN"
-                self.corner_cool_end_time = now + self.corner_cooldown
-                self.turn_yaw_start = None
-                self.turn_yaw_target = None
-                self.turn_hold_cnt = 0
-                self._yaw_buf[:] = []
-                self.set_state("ALIGN", "CORNER_TURN_DONE")
-                self.stop("CORNER_TURN_DONE")
+        # 1) trigger
+        if s == "C_IDLE":
+            yaw_ok = (self.wall_yaw==self.wall_yaw) and (abs(self.wall_yaw - self.yaw_trim) <= self.align_tol_y)
+            if (self._is_wall_following_simple() and yaw_ok and (x_ok or r_ok)):
+                self.corner_state = "C_STEP_OUT"
+                self._c_t_enter   = now
+                self._wz_prev     = 0.0
+                self._turn_yaw0   = None
+                self._turn_T = None; self._turn_t0 = None; self._snap_t0 = None
+                self._cx_filt = None; self._cx_hold_t0 = None; self._approach_t0 = None
+                self.stop("C_IDLE→C_STEP_OUT (cx=%.2f r=%.2f)" % (cx, self.corner_dist))
+                return True
+            return False
+
+        # 2) STEP_OUT —— 单阶段：同时 vx + vy（侧向优先，前爬贴角）
+        if s == "C_STEP_OUT":
+            ok_side  = (opp_min >= need_side)
+            if self._approach_t0 is None: self._approach_t0 = now
+            timeoutA = ((now - self._c_t_enter) > self.corner_step_timeout)
+            timeoutB = ((now - self._approach_t0) > self.corner_approach_timeout)
+            timeout  = timeoutA or timeoutB
+
+            # 角点x：补偿 + 轻滤波
+            cx_corr = cx - self.corner_cx_offset
+            if not np.isfinite(cx_corr):
+                cx_f = float('inf')
+            else:
+                self._cx_filt = cx_corr if (self._cx_filt is None) else ((1.0 - self.corner_cx_beta)*self._cx_filt + self.corner_cx_beta*cx_corr)
+                cx_f = float(self._cx_filt)
+
+            # 目标到位 & 保持
+            target_ok = ok_side and (cx_f <= self.corner_cx_target) and (cx_f >= self.corner_cx_min)
+            if target_ok:
+                if self._cx_hold_t0 is None: self._cx_hold_t0 = now
+                hold_ok = ((now - self._cx_hold_t0) >= self.corner_cx_hold)
+            else:
+                self._cx_hold_t0 = None
+                hold_ok = False
+
+            # vy：侧向未达标 -> 给足；已达标 -> 40% 维持
+            vy_mag = (self.corner_step_vy if not ok_side else 0.4*self.corner_step_vy)
+            vy = vy_mag * ( +1.0 if self.side=="right" else -1.0 ) * self.cmd_vy_sign
+
+            # vx：仅在侧向达标 + 前方安全 + cx偏大时前爬
+            front_safe = (not np.isfinite(self.front_min)) or (self.front_min >= self.front_stop_min)
+            vx = self.corner_approach_vx if (ok_side and front_safe and (cx_f > self.corner_cx_target)) else 0.0
+
+            # 进入转弯：目标已保持 or 超时兜底
+            if hold_ok or timeout:
+                self.corner_state = "C_TURN"
+                self._c_t_enter   = now
+                self._turn_yaw0   = self._get_pose_odom()[2]
+                self._wz_prev     = 0.0
+                self._soft_gate   = 1.0
+
+                # snap目标 = 本次会话平行零点（优先 _yaw_trim_epi）
+                base = self._yaw_trim_epi if (self._yaw_trim_epi is not None) else self.yaw_trim
+                self.wall_yaw_enter = self.wall_yaw if (self.has_wall and self.wall_yaw == self.wall_yaw) else None
+                self.yaw_trim_turn  = float(base)
+
+                # 定时兜底
+                ang   = math.radians(self.corner_turn_angle_deg)
+                T_nom = self.turn_time_gain * ang / max(1e-3, self.turn_w_set) + self.turn_time_margin
+                self._turn_T  = min(self.turn_time_max, max(self.turn_time_min, T_nom))
+                self._turn_t0 = now
+                self._snap_t0 = None
+
+                self.stop("C_STEP_OUT→C_TURN (cx=%.2f tgt=%.2f side=%.2f/%.2f front=%.2f T=%.2fs%s)" %
+                          (cx_f, self.corner_cx_target, opp_min, need_side, self.front_min, self._turn_T,
+                           " timeout" if timeout else ""))
+                return True
+
+            # 继续单阶段贴角
+            self._publish(vx, vy, 0.0, "C_STEP_OUT combo vx=%.2f vy=%.2f cx=%.2f side=%.2f/%.2f front=%.2f"
+                          % (vx, vy, cx_f, opp_min, need_side, self.front_min))
             return True
 
-        if self.corner_state == "COOLDOWN":
-            if now < self.corner_cool_end_time:
-                return False
+        # 3) TURN (by time, optional wall snap)
+        if s == "C_TURN":
+            sign = -1.0 if self.side == "right" else +1.0
+
+            # 误差闭环 + 加速度限幅
+            use_err = (self.turn_mode == "wall") and self.has_wall and (self.wall_yaw == self.wall_yaw)
+            if use_err:
+                err  = ang_norm(self.yaw_trim_turn - self.wall_yaw)
+                k_wt = getattr(self, "k_w_turn", 1.5)
+                w_des = clamp(k_wt * err, -self.turn_w_set, self.turn_w_set)
             else:
-                self.corner_state = "IDLE"
-                self.corner_armed = False
-                self.corner_arm_cnt = 0
-                self.corner_prev_dist = None
-                rospy.loginfo("[CORNER] 冷却结束，回到 IDLE（解除武装）")
-                return False
+                w_des = sign * self.turn_w_set
 
-        if self.corner_state == "APPROACH_STOP":
-            if now < self.corner_prepare_end:
-                for _ in range(int(self.corner_brake_times)):
-                    self.stop("CORNER_PREPARE_STOP")
-                return True
+            dv = self.corner_w_accel * dt
+            w_cmd = self._wz_prev
+            if w_des > w_cmd + dv: w_cmd = w_cmd + dv
+            elif w_des < w_cmd - dv: w_cmd = w_cmd - dv
+            else: w_cmd = w_des
+            self._wz_prev = w_cmd
+
+            elapsed   = now - (self._turn_t0 if self._turn_t0 is not None else now)
+            done_time = (self._turn_T is not None) and (elapsed >= self._turn_T)
+
+            # snap：最小时间门槛后，直接对“平行零点”判稳并hold
+            done_snap = False
+            allow_snap = (elapsed >= self.turn_time_min)
+            if self.turn_mode in ("wall", "time") and self.has_wall and (self.wall_yaw == self.wall_yaw):
+                if allow_snap:
+                    err_snap = ang_norm(self.wall_yaw - self.yaw_trim_turn)
+                    if abs(err_snap) <= math.radians(self.wall_snap_eps_deg):
+                        if self._snap_t0 is None: self._snap_t0 = now
+                        if (now - self._snap_t0) >= self.wall_snap_hold:
+                            done_snap = True
+                    else:
+                        self._snap_t0 = None
             else:
-                if len(self._yaw_buf) > 0:
-                    yaw_start = sorted(self._yaw_buf)[len(self._yaw_buf)//2]
-                else:
-                    yaw_start = self.wall_yaw
-                self.turn_yaw_start = yaw_start
-                turn_sign = -1.0 if self.side == "right" else +1.0
-                self.turn_yaw_target = self._wrap(yaw_start + turn_sign * (np.pi/2.0))
-                self.turn_hold_cnt = 0
+                self._snap_t0 = None
 
-                t_need = abs(self.corner_turn_angle) / max(0.1, abs(self.corner_turn_speed))
-                self.corner_turn_end_time = now + max(t_need, 1.5)
-
-                self.corner_state = "TURNING"
-                rospy.loginfo("[CORNER] 开始转弯 90.0°(墙角闭环) 目标yaw=%.1f°",
-                            self.turn_yaw_target*180.0/np.pi)
-                self.stop("CORNER_TURN_BEGIN")
-                return True
-
-        if self.corner_state == "IDLE" and self.corner_has and (self.corner_pt is not None):
-            dist = self.corner_dist
-
-            if getattr(self, "corner_forward_only", True) and self.corner_pt[0] <= 0.0:
-                self.corner_prev_dist = dist
-                return False
-
-            if dist > self.corner_reset_dist:
-                self.corner_arm_cnt += 1
-                if self.corner_arm_cnt >= self.corner_arm_samples:
-                    self.corner_armed = True
+            finish = False
+            if self.turn_mode == "time":
+                finish = done_time
+            elif self.turn_mode == "wall":
+                finish = done_snap or done_time
             else:
-                self.corner_arm_cnt = 0
+                finish = done_time
 
-            can_trigger_by_state = (self.state in self.corner_trigger_in_states)
-            moving_forward = (abs(self.current_vx) > self.corner_min_vx_to_trigger)
+            if finish:
+                self.corner_state = "C_COOL"
+                self._c_t_enter   = now
+                self._wz_prev     = 0.0
 
-            decreasing = (self.corner_prev_dist is not None) and \
-                        ((self.corner_prev_dist - dist) > self.corner_trend_eps)
+                # 转后强制进入 ALIGN，开启更严容差，并重置later-align自零点窗口
+                if self.post_turn_force_align:
+                    self.state = "ALIGN"
+                    self._post_turn_until = now + self.post_turn_align_lock_time
+                    if self.auto_yaw_zero:
+                        self._az_t0 = now
+                        self._az_buf = []
+                        self._yaw_trim_epi = None
 
-            if self.corner_armed and can_trigger_by_state and moving_forward and decreasing and (dist < self.corner_trigger_dist):
-                self.corner_prepare_end = now + self.corner_prepare_t
-                self.corner_state = "APPROACH_STOP"
-                self.corner_armed = False
-                self.corner_arm_cnt = 0
-                rospy.loginfo("[CORNER] 触发@%.2fm → 预停 %.2fs 后转弯", dist, self.corner_prepare_t)
-                self.stop("CORNER_PREPARE")
-                self.corner_prev_dist = dist
+                self.stop("C_TURN→C_COOL (t=%.2fs/T=%.2fs snap=%s allow=%s)" %
+                          (elapsed, self._turn_T or -1, done_snap, allow_snap))
                 return True
 
-            # >>> PATCH: 近距直接预停（当场景较小、很难先经历 reset> 的情况）
-            if (not self.corner_armed) and can_trigger_by_state and moving_forward and (dist < self.corner_trigger_dist):
-                self.corner_prepare_end = now + self.corner_prepare_t
-                self.corner_state = "APPROACH_STOP"
-                self.corner_armed = False
-                self.corner_arm_cnt = 0
-                rospy.loginfo("[CORNER] 近距直接预停@%.2fm", dist)
-                self.stop("CORNER_PREPARE")
-                self.corner_prev_dist = dist
-                return True
-            # <<< PATCH
+            self._publish(0.0, 0.0, w_cmd, "C_TURN t=%.2f/%.2f wz=%.2f" % (elapsed, self._turn_T or -1, w_cmd))
+            return True
 
-            self.corner_prev_dist = dist
-            return False
+        # 4) COOL
+        if s == "C_COOL":
+            if (now - self._c_t_enter) >= self.corner_cooldown:
+                self.corner_state = "C_IDLE"
+                if self.post_turn_force_align:
+                    self.state = "ALIGN"
+                self.stop("C_COOL→C_IDLE")
+                return False
+            self.stop("C_COOL")
+            return True
 
+        # fallback
+        self.corner_state = "C_IDLE"
         return False
-    def _ensure_side_clearance(self):
-        """
-        侧向外摆到 safe_clearance（远离当前贴墙一侧），超时则以当下为准。
-        返回 True/False 表示是否达到目标（超时也返回 True 继续走后续转弯，以免卡死）。
-        """
-        want = float(self.safe_clearance)
-        deadline = rospy.Time.now().to_sec() + float(self.clear_timeout)
-        side_sign = +1.0 if (self.side == "right") else -1.0  # 右墙→+y（向左外摆）
 
-        while not rospy.is_shutdown() and rospy.Time.now().to_sec() < deadline:
-            # 没可靠墙距就别硬外摆
-            if not self.has_wall or not (self.wall_dist == self.wall_dist):
-                self.stop("CLEAR_NO_WALL")
-                return False
-
-            e = want - self.wall_dist
-            if abs(e) < 0.02:  # 达标
-                self.stop("CLEAR_DONE")
-                return True
-
-            vy_cmd = side_sign * max(min(self.k_vy * e, self.clear_speed), -self.clear_speed)
-            self.publish(0.0, vy_cmd, 0.0, "CLEARING_FOR_TURN")
-            rospy.sleep(0.05)
-
-        self.stop("CLEAR_TIMEOUT")
-        return True  # 超时也放行，避免卡死
-
-    def _turn_in_place_minus_90(self):
-        """
-        原地转 -90°（顺时针），只给角速度，vx=vy=0。
-        若你之前已经做了“墙角/墙向闭环”，也可以继续用；这里给最简单版的定时兜底。
-        """
-        turn_sign = 1.0  # changed!!!固定 -90°
-        w = turn_sign * self.simple_turn_speed  # 你已有：~simple_turn_speed 缺省 0.6 rad/s
-        t_need = (np.pi/2.0) / max(0.1, abs(self.simple_turn_speed))  # 理论时长
-        deadline = rospy.Time.now().to_sec() + max(1.5, t_need)       # 兜底
-
-        while not rospy.is_shutdown() and rospy.Time.now().to_sec() < deadline:
-            # 可选安全：侧向 watchdog（离墙太近立即停并返回 False）
-            if self.has_wall and (self.wall_dist == self.wall_dist) and (self.wall_dist < 0.40):
-                self.stop("TURN_ABORT_SIDE_TOO_CLOSE")
-                return False
-
-            self.publish(0.0, 0.0, w, "TURN_IN_PLACE_-90")
-            rospy.sleep(0.02)
-
-        self.stop("TURN_DONE_SIMPLE")
-        return True
-
-    def turn_with_clearance_and_resume(self):
-        """
-        简单总流程：先外摆到安全侧距 → 原地转 -90° → 回 ALIGN，让原有沿墙接管。
-        """
-        self.stop("TURN_PREPARE")
-        ok_clear = self._ensure_side_clearance()
-        ok_turn  = self._turn_in_place_minus_90()
-        self.set_state("ALIGN", "AFTER_TURN")
-        self.stop("AFTER_TURN_STOP")
-        return ok_clear and ok_turn
-        # ===== 在类中新增：极简拐角三步 =====
-    def _side_offset_until_clear(self):
-        """若贴墙太近，先侧向让位到 target_dist + extra，避免转弯扫墙。"""
-        want = self.target_dist + self.simple_clear_extra
-        deadline = rospy.Time.now().to_sec() + self.simple_side_timeout
-        # right → +y (left), left → -y (right)
-        sign = +1.0 if (self.side == "right") else -1.0
-
-        while not rospy.is_shutdown() and rospy.Time.now().to_sec() < deadline:
-            if self.has_wall and (self.wall_dist == self.wall_dist):
-                e = want - self.wall_dist
-                if abs(e) < 0.02:  # 足够净空
-                    self.stop("SIDE_CLEAR_DONE")
-                    return True
-                vy_cmd = sign * max(min(self.k_vy * e, self.simple_side_speed), -self.simple_side_speed)
-                self.publish(0.0, vy_cmd, 0.0, "SIDE_CLEARING")
-            else:
-                # 没可靠墙距就别强求
-                self.stop("SIDE_CLEAR_NO_WALL")
-                return False
-            rospy.sleep(0.05)
-
-        self.stop("SIDE_CLEAR_TIMEOUT")
-        return True  # 即便超时，也继续转（保守处理）
-
-
-    def _turn_90_by_wall_yaw(self):
-        """原地 90° 转，靠 /wall_angle 做闭环校验，超时兜底。"""
-        # 当前墙朝向作为起点
-        yaw_start = self.wall_yaw if self.wall_yaw == self.wall_yaw else 0.0
-        turn_sign = 1.0 if self.side == "right" else -1.0
-        yaw_target = self._wrap(yaw_start + turn_sign * (np.pi/2.0))
-
-        tol = self.simple_yaw_tol_deg * np.pi/180.0
-        hold_need = self.simple_yaw_hold_frames
-        hold_cnt = 0
-        deadline = rospy.Time.now().to_sec() + self.simple_turn_timeout
-        turn_start = rospy.Time.now().to_sec()
-
-
-        while not rospy.is_shutdown():
-            # 安全闸：前方障碍则停
-            #if self.obs_front:
-            #    self.stop("TURN_SAFE_STOP_OBS")
-            #    return False
-
-            # 角度闭环
-            if self.wall_yaw == self.wall_yaw:
-                err = abs(self._wrap(self.wall_yaw - yaw_target))
-                if err <= tol: hold_cnt += 1
-                else:          hold_cnt  = 0
-                if hold_cnt >= hold_need:
-                    self.stop("TURN_DONE_BY_YAW")
-                    return True
-
-            # 兜底超时
-            if rospy.Time.now().to_sec() > deadline:
-                self.stop("TURN_TIMEOUT_DONE")
-                return True
-
-            # 原地转 -> 改为带轻微后退
-            vx_back = 0.0
-            if self.turn_back_enable and (rospy.Time.now().to_sec() - turn_start) < self.turn_back_duration:
-                vx_back = self.turn_back_vx
-            vy_push = self.turn_side_push_vy 
-            self.publish(vx_back, vy_push, turn_sign * self.simple_turn_speed, "TURN_90")
-
-
-    def simple_corner_manager(self):
-        """
-        极简角点逻辑：
-        1) 角点存在 && 距离 <= 1.2m（默认）&&（可选：角点在前方）
-        2) 若侧向净空不足，先让位
-        3) 原地 90° 转，转完回 ALIGN
-        """
-        # 角点条件
-        if not self.corner_has or (self.corner_dist != self.corner_dist):
-            return False
-        if self.corner_dist > self.simple_corner_turn_dist:
-            return False
-        if self.simple_forward_only and self.corner_pt and (self.corner_pt[0] <= 0.0):
-            return False  # 只接受前方角点
-
-        # Step 1：停稳（你已有）
-        self.stop("CORNER_TRIGGERED")
-
-        # Step 2：外摆到安全侧距 + 原地 -90°
-        self.turn_with_clearance_and_resume()
-
-        # 返回 True 让主循环这帧结束
-        return True
-
-
-        # === 主循环 ===
+    # ---------- main FSM ----------
     def run(self):
-        rate = rospy.Rate(20)
+        rate = rospy.Rate(30)
+        hold_loss_cnt = 0
         while not rospy.is_shutdown():
             now = rospy.Time.now().to_sec()
+
+            # Corner FSM 优先
+            if self.corner_fsm():
+                rate.sleep(); continue
+
+            # 进入ALIGN的瞬间：首次ALIGN/后续ALIGN的零点窗口
+            entered_align = (self.state == "ALIGN" and self._prev_state != "ALIGN")
+            if entered_align:
+                if (not self._first_align_done) and self.first_align_freeze:
+                    self._first_align_active = True
+                    self._first_align_t0 = now
+                    self._first_align_buf = []
+                if self.auto_yaw_zero:
+                    self._az_t0 = now
+                    self._az_buf = []
+                    self._yaw_trim_epi = None
+            self._prev_state = self.state
+
             vx = vy = wz = 0.0
             reason = ""
-            if self.simple_corner_manager():
-                rate.sleep()
-                continue
-                        # 角点子 FSM：若需要转弯则拦截一切
-            #if self.corner_fsm():
-            #    rate.sleep()
-             #   continue
-
-            # >>> PATCH: 全局安全闸——任何状态下遇到前障/近距角点直接刹停
-            #if self.obs_front:
-            #    self.stop("SAFE_STOP_OBS_FRONT")
-             #   rate.sleep(); continue
-            #if self.corner_has and (self.corner_dist == self.corner_dist) and (self.corner_dist < 0.55):
-            #    self.stop("SAFE_STOP_CORNER_NEAR")
-            #    rate.sleep(); continue
-            # <<< PATCH
-
-            perc_age = (now - self.last_perc_t) if self.last_perc_t else 999
 
             if self.state == "ALIGN":
-                if self.has_wall and not isnan(self.wall_dist) and not isnan(self.wall_yaw):
-                    self.mem_dist = self.wall_dist
-                    self.mem_yaw  = self.wall_yaw
-                    self.mem_time = now
+                # FIRST ALIGN：冻结wz，收集中位零点
+                if self._first_align_active and (not self._first_align_done):
+                    if self.has_wall and (self.wall_yaw == self.wall_yaw):
+                        dist_ok = (abs(self.target_dist - self.wall_dist) <= self.first_align_dist_gate) if self.first_align_require_dist else True
+                        if dist_ok:
+                            self._first_align_buf.append(self.wall_yaw)
 
-                    e_d   = self.target_dist - self.wall_dist
-                    e_yaw = -self.wall_yaw
+                    elapsed = now - self._first_align_t0
+                    got_enough = (len(self._first_align_buf) >= self.first_align_samples_min)
+                    stable = False
+                    if got_enough:
+                        spread = (max(self._first_align_buf) - min(self._first_align_buf))
+                        stable = (spread <= math.radians(self.first_align_var_gate_deg))
 
-                    side_dir = +1.0 if (self.side == "right") else -1.0  # right→+y(左), left→-y(右)
-                    vy = side_dir * max(min(self.k_vy * e_d, self.max_vy), -self.max_vy)
-                    wz = max(min(self.k_w  * e_yaw, self.max_w), -self.max_w)
-                    vx = 0.05
-                    reason = "ALIGNING"
+                    lock_now = (got_enough and stable) or (elapsed >= self.first_align_zero_window and got_enough)
+                    timeout_force = (elapsed >= self.first_align_freeze_max and len(self._first_align_buf) > 0)
 
-                    if abs(e_d) <= self.align_tol_d and abs(self.wall_yaw) <= self.align_tol_y:
-                        self.set_state("LOCKED_GO", "ALIGN_DONE")
-                        self.stop("ALIGN_DONE")
-                        rate.sleep()
-                        continue
+                    if lock_now or timeout_force:
+                        median_yaw = float(np.median(self._first_align_buf))
+                        self._yaw_trim_epi = median_yaw
+                        self.yaw_trim = median_yaw
+                        self._first_align_done = True
+                        self._first_align_active = False
+                        reason = f"ALIGN_FIRST_ZERO_LOCK({median_yaw:.3f}rad)"
+
+                    e_d = (self.target_dist - self.wall_dist) if (self.wall_dist==self.wall_dist) else 0.0
+                    e_d_eff = 0.0 if abs(e_d) <= self.deadzone_d else e_d
+                    vy = clamp(self.k_vy * e_d_eff, -self.max_vy, self.max_vy) * (+1.0 if self.side=="right" else -1.0)
+                    vx = +0.03
+                    wz = 0.0
+                    self._publish(vx, vy, wz, "ALIGN_FIRST_ZEROING" if reason=="" else reason)
+                    rate.sleep()
+                    continue
+
+                # Later ALIGN：短窗自零点（不冻结）
+                if self.auto_yaw_zero and (self._az_t0 is not None) and ((now - self._az_t0) <= self.auto_yaw_window):
+                    if self.has_wall and self.wall_dist==self.wall_dist and self.wall_yaw==self.wall_yaw:
+                        if abs(self.target_dist - self.wall_dist) <= self.auto_yaw_dist_gate:
+                            self._az_buf.append(self.wall_yaw)
+                    if len(self._az_buf) >= self.auto_yaw_samples_min:
+                        med = float(np.median(self._az_buf))
+                        spread = (max(self._az_buf) - min(self._az_buf)) if self._az_buf else 1e9
+                        if spread <= math.radians(self.auto_yaw_var_gate_deg):
+                            self._yaw_trim_epi = med
+                if self.auto_yaw_zero and (self._az_t0 is not None) and ((now - self._az_t0) > self.auto_yaw_window) and (self._yaw_trim_epi is None) and len(self._az_buf) > 0:
+                    self._yaw_trim_epi = float(np.median(self._az_buf))
+
+                if self.has_wall and (self.wall_dist==self.wall_dist) and (self.wall_yaw==self.wall_yaw):
+                    e_d      = (self.target_dist - self.wall_dist)
+                    yaw_bias = (self._yaw_trim_epi if (self._yaw_trim_epi is not None) else self.yaw_trim)
+                    yaw_meas = self.wall_yaw - yaw_bias
+
+                    e_d_eff = 0.0 if abs(e_d) <= self.deadzone_d else e_d
+                    vy = clamp(self.k_vy * e_d_eff, -self.max_vy, self.max_vy) * (+1.0 if self.side=="right" else -1.0)
+
+                    yaw_err = 0.0 if abs(yaw_meas) <= self.deadzone_y else -yaw_meas
+                    if abs(e_d) > self.dist_freeze_on:
+                        yaw_err *= self.dist_freeze_scale
+
+                    wz = clamp(self.k_w * yaw_err, -self.align_w_max, self.align_w_max)
+                    vx = +0.05
+
+                    post_turn = (self._post_turn_until > now)
+                    tol_y = (self.post_turn_align_tol_y if post_turn else self.align_tol_y)
+
+                    if (abs(e_d) <= self.align_tol_d) and (abs(yaw_meas) <= tol_y):
+                        self.state = "LOCKED_GO"
+                        reason = "ALIGN->LOCKED_GO"
+                        if self._yaw_trim_epi is not None:
+                            alpha = 0.1
+                            self.yaw_trim = (1.0 - alpha) * self.yaw_trim + alpha * self._yaw_trim_epi
+                    else:
+                        reason = "ALIGNING"
                 else:
-                    self.set_state("HOLD", "ALIGN_LOSS→HOLD")
-                    self.loss_events.append(now)
-                    vx = self.forward_speed_hold
-                    reason = "ALIGN_LOSS→HOLD"
+                    vx, vy, wz = +0.02, 0.0, 0.0
+                    reason = "ALIGN_WAIT_WALL"
 
             elif self.state == "LOCKED_GO":
-                vx = self.forward_speed
+                if self.has_wall and (self.wall_dist==self.wall_dist) and (self.wall_yaw==self.wall_yaw):
+                    e_d      = (self.target_dist - self.wall_dist)
+                    yaw_bias = (self._yaw_trim_epi if (self._yaw_trim_epi is not None) else self.yaw_trim)
+                    yaw_meas = self.wall_yaw - yaw_bias
 
-                if self.has_wall and not isnan(self.wall_dist) and not isnan(self.wall_yaw):
-                    e_d = self.target_dist - self.wall_dist
-                    e_d_eff = 0.0 if abs(e_d) < self.deadzone_d else e_d
-                    side_dir = +1.0 if (self.side == "right") else -1.0
-                    vy_raw = side_dir * self.k_vy_go * e_d_eff
-                    vy = max(min(vy_raw, self.max_vy_go), -self.max_vy_go)
+                    e_yaw    = 0.0 if abs(yaw_meas) <= self.deadzone_y else -yaw_meas
+                    e_d_eff  = 0.0 if abs(e_d) <= self.deadzone_d else e_d
 
-                    e_yaw = -self.wall_yaw
-                    e_yaw_eff = 0.0 if abs(e_yaw) < self.deadzone_yaw else e_yaw
-                    wz_raw = self.k_w_go * e_yaw_eff
-                    wz = max(min(wz_raw, self.max_w_go), -self.max_w_go)
-
-                    reason = "LOCKED_GO(vx+vy+wz)"
-                    self.mem_dist = self.wall_dist
-                    self.mem_yaw  = self.wall_yaw
-                    self.mem_time = now
-                else:
-                    self.set_state("HOLD", "LOCKED→HOLD")
-                    self.loss_events.append(now)
-                    self.stop("LOCKED→HOLD")
-                    rate.sleep()
-                    continue
-
-            elif self.state == "HOLD":
-                vx = self.forward_speed_hold
-                reason = "HOLD_KEEP_STRAIGHT"
-
-                # >>> PATCH: 首次再捕获初始化——一旦有墙信息就建立记忆并回ALIGN
-                if self.has_wall and not isnan(self.wall_dist) and not isnan(self.wall_yaw) and (not self.mem_time):
-                    self.mem_dist = self.wall_dist
-                    self.mem_yaw  = self.wall_yaw
-                    self.mem_time = now
-                    self.set_state("ALIGN", "HOLD→ALIGN_INIT_REACQ")
-                    self.stop("HOLD→ALIGN_INIT_REACQ")
-                    rate.sleep()
-                    continue
-                # <<< PATCH
-
-                if self.has_wall and not isnan(self.wall_dist) and not isnan(self.wall_yaw) and self.mem_time:
-                    if abs(self.wall_dist - self.mem_dist) <= self.reacq_tol_d and abs(self.wall_yaw - self.mem_yaw) <= self.reacq_tol_y:
-                        self.set_state("LOCKED_GO", "REACQ→LOCKED")
-                        self.stop("REACQ→LOCKED")
-                        rate.sleep()
-                        continue
+                    if self.post_turn_force_align and (
+                        (abs(yaw_meas) > self.locked_to_align_y) or (abs(e_d) > self.align_tol_d)
+                    ):
+                        self.state = "ALIGN"
+                        reason = "LOCKED->ALIGN_POST_TURN"
+                        vx, vy, wz = +0.02, 0.0, 0.0
                     else:
-                        self.mem_dist = self.wall_dist
-                        self.mem_yaw  = self.wall_yaw
-                        self.mem_time = now
-                        reason = "HOLD_MEM_UPDATE"
+                        vy = clamp(0.9*self.k_vy * e_d_eff, -self.max_vy, self.max_vy) * ( +1.0 if self.side=="right" else -1.0 )
+                        wz = clamp(0.8*self.k_w  * e_yaw,   -self.max_w,  self.max_w)
+                        vx = self.forward_speed
+                        reason = "LOCKED_GO"
+                else:
+                    self.state = "HOLD"; hold_loss_cnt = 0; reason = "LOCKED->HOLD"
 
-                nloss = self.losses_in_window(now)
-                if nloss >= self.loss_slowdown_thresh and self.forward_speed > self.min_forward_speed:
-                    self.forward_speed = max(self.min_forward_speed, self.forward_speed - 0.02)
-                    self.forward_speed_hold = max(self.min_forward_speed, self.forward_speed_hold - 0.02)
-                    reason = f"HOLD_SLOWDOWN(n={nloss})"
+            else:  # HOLD
+                vx = self.forward_speed_hold; vy = 0.0; wz = 0.0
+                reason = "HOLD_KEEP_STRAIGHT"
+                got = (self.has_wall and self.wall_dist==self.wall_dist and self.wall_yaw==self.wall_yaw)
+                if got:
+                    if (self.mem_dist==self.mem_dist) and (self.mem_yaw==self.mem_yaw):
+                        if abs(self.wall_dist-self.mem_dist) <= (self.align_tol_d+0.02) and abs(self.wall_yaw-self.mem_yaw) <= (self.align_tol_y+0.05):
+                            self.state = "LOCKED_GO"; reason = "HOLD->LOCKED(mem match)"
+                        else:
+                            self.state = "ALIGN";     reason = "HOLD->ALIGN"
+                    else:
+                        self.state = "ALIGN";         reason = "HOLD->ALIGN"
+                else:
+                    hold_loss_cnt = min(self.loss_window, hold_loss_cnt+1)
+                    if hold_loss_cnt >= self.loss_slowdown_thresh:
+                        vx = 0.06; reason += "|slow"
 
-            elif self.state == "FAIL_STOP":
-                self.stop("STOP_STATE")
-                rate.sleep()
-                continue
-
-            self.publish(vx, vy, wz, reason)
+            self._publish(vx, vy, wz, reason)
             rate.sleep()
 
     def __del__(self):
-        try:
-            self.csvf.close()
-        except:
-            pass
+        try: self.csvf.close()
+        except Exception: pass
+
 
 if __name__ == "__main__":
-    rospy.init_node("bug2_lock_v2")
-    LockerV2().run()
+    rospy.init_node("bug2_lock_v4_openloop")
+    WallFollower().run()
